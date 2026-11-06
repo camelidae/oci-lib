@@ -145,7 +145,10 @@ pub fn resolved_command(command: &[String], args: &[String], image: &ImageSpec) 
 /// Host path of the module inside an unpacked rootfs.
 #[must_use]
 pub fn module_path(rootfs: &str, argv: &[String]) -> Option<std::path::PathBuf> {
-    let guest = argv.iter().find(|arg| arg.ends_with(".wasm"))?;
+    let guest = argv.first()?;
+    if !guest.ends_with(".wasm") {
+        return None;
+    }
     let relative = guest.trim_start_matches('/');
     Some(std::path::Path::new(rootfs).join(relative))
 }
@@ -234,6 +237,11 @@ mod tests {
     fn module_path_joins_the_rootfs() {
         let path = module_path("/var/root", &["/bin/app.wasm".into()]).unwrap();
         assert_eq!(path, std::path::PathBuf::from("/var/root/bin/app.wasm"));
+    }
+
+    #[test]
+    fn module_path_ignores_a_later_wasm_argument() {
+        assert!(module_path("/var/root", &["/bin/tool".into(), "x.wasm".into()]).is_none());
     }
 
     #[test]

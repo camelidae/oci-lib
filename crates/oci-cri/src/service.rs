@@ -1406,16 +1406,14 @@ fn wasm_environment(image: &EngineImage, config: &ContainerConfig) -> Vec<(Strin
             if key.is_empty() {
                 continue;
             }
+            envs.retain(|(existing, _)| existing != key);
             envs.push((key.to_string(), value.to_string()));
         }
     }
     for item in &config.envs {
         let value = String::from_utf8_lossy(&item.value).into_owned();
-        if let Some(existing) = envs.iter_mut().find(|(key, _)| key == &item.key) {
-            existing.1 = value;
-        } else {
-            envs.push((item.key.clone(), value));
-        }
+        envs.retain(|(key, _)| key != &item.key);
+        envs.push((item.key.clone(), value));
     }
     envs
 }
@@ -1450,6 +1448,14 @@ fn finish_wasm_container(
     let netns = if sandbox.host_network {
         String::new()
     } else {
+        let state = inner.engine.container_state(&sandbox.infra_container_id)?;
+        if state.status != "running" || state.pid <= 0 {
+            return Err(Error::new(
+                ErrorCode::State,
+                "sandbox network namespace is not available",
+                "",
+            ));
+        }
         inner
             .namespace_paths(sandbox)?
             .network
