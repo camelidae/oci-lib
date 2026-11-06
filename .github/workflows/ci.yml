@@ -50,6 +50,31 @@ jobs:
       - run: cargo test --workspace --locked --lib --bins --examples
       - run: cargo test --workspace --locked --doc
 
+  zwasm-helper:
+    name: zwasm helper
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+      - uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: ${{ runner.os }}-zwasm-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-zwasm-
+      - name: Build the guest runner
+        run: |
+          cargo clippy -p oci-cri-zwasm --features zwasm --locked --all-targets -- -D warnings
+          cargo build -p oci-cri-zwasm --features zwasm --locked --release
+          ls -l target/release/oci-cri-zwasm
+
   linux-rootful:
     name: rootful build and push
     runs-on: ubuntu-latest

@@ -243,7 +243,6 @@ impl Inner {
             .ok();
     }
 
-    #[cfg(feature = "zwasm")]
     fn spawn_exit_monitor<F>(&self, container_id: String, wait: F)
     where
         F: FnOnce(&str) -> i32 + Send + 'static,
@@ -396,7 +395,7 @@ fn runtime_handlers() -> Vec<RuntimeHandler> {
             user_namespaces: false,
         }),
     }];
-    if cfg!(feature = "zwasm") {
+    if crate::wasm_host::require_helper().is_ok() {
         handlers.push(RuntimeHandler {
             name: crate::wasm::HANDLER.to_string(),
             features: Some(RuntimeHandlerFeatures::default()),
@@ -1620,21 +1619,6 @@ fn signal_pid(pid: i32, signal: i32) {
     }
 }
 
-#[cfg(not(feature = "zwasm"))]
-fn start_wasm_container(
-    inner: &Inner,
-    record: ContainerRecord,
-    sink: crate::engine::OutputSink,
-) -> CrateResult<()> {
-    let _ = (inner, record, sink);
-    Err(Error::new(
-        ErrorCode::Unsupported,
-        "wasm workloads require oci-cri built with the zwasm feature",
-        "",
-    ))
-}
-
-#[cfg(feature = "zwasm")]
 fn start_wasm_container(
     inner: &Inner,
     mut record: ContainerRecord,
@@ -1683,6 +1667,9 @@ pub(crate) fn create_container_sync(
     let argv = crate::wasm::resolved_command(&config.command, &config.args, &image_config);
     let wasm = crate::wasm::classify(&sandbox.runtime_handler, &image_config, &argv)?;
     let id = new_id();
+    if wasm.is_some() {
+        crate::wasm_host::require_helper()?;
+    }
     let rootfs = inner.engine.prepare_rootfs(&id, &image.id)?;
     if let Some(choice) = wasm {
         return finish_wasm_container(

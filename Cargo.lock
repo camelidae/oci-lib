@@ -1374,6 +1374,7 @@ dependencies = [
  "objc2",
  "objc2-virtualization",
  "oci-cri",
+ "oci-cri-zwasm",
  "oci-spec",
  "oci-util",
  "prost",
@@ -1388,6 +1389,15 @@ dependencies = [
  "tonic-prost",
  "tonic-prost-build",
  "tower",
+]
+
+[[package]]
+name = "oci-cri-zwasm"
+version = "0.1.14"
+dependencies = [
+ "libc",
+ "serde",
+ "serde_json",
  "zwasm-sdk",
 ]
 

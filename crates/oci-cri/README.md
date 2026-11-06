@@ -44,6 +44,24 @@ kubelet --container-runtime-endpoint=unix:///run/oci-cri/oci-cri.sock ...
 crictl --runtime-endpoint unix:///run/oci-cri/oci-cri.sock info
 ```
 
+## WASM
+
+Preview1 modules run in a second executable, `oci-cri-zwasm`. The `oci-cri`
+daemon does not link the engine, so turning WASM on does not grow that binary.
+Install the runner beside `oci-cri` (or the process that embeds this library),
+put it on `PATH`, or set `OCI_CRI_ZWASM_BIN`. A node advertises the `zwasm`
+RuntimeClass handler only when that file is found. Images that select WASM and
+have no runner fail at create.
+
+```sh
+# Zig 0.16 is required to compile the runner. It is not required at runtime.
+cargo build -p oci-cri-zwasm --release --features zwasm
+install -m 0755 target/release/oci-cri-zwasm /usr/local/bin/oci-cri-zwasm
+```
+
+The runner accepts WASI preview1 `_start` only. wasip2 and wasip3 exit 127.
+Exec and attach are not implemented for WASM containers.
+
 ## Library usage
 
 ```rust,ignore

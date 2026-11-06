@@ -4,36 +4,14 @@
 //!
 //! The pause container stays on libcontainer. A workload container is WASM
 //! when the sandbox handler is `zwasm`, or when the image or the resolved
-//! command says so. Builds without the `zwasm` feature still classify
-//! containers, and refuse to create one.
-
-use serde::{Deserialize, Serialize};
+//! command says so. The engine is the separate `oci-cri-zwasm` binary.
 
 use crate::engine::ImageSpec;
 use crate::error::{Error, ErrorCode, Result};
 
-/// Frozen WASI setup for one container. The guest process reads this JSON
-/// from stdin.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct WasmRun {
-    /// Daemon-owned copy of the module, captured at create.
-    /// Later starts read this file and do not reopen the rootfs.
-    pub module_path: std::path::PathBuf,
-    /// Guest argv. The first entry is the program name.
-    pub args: Vec<String>,
-    /// Guest environment pairs.
-    pub envs: Vec<(String, String)>,
-    /// Host directory, guest path.
-    pub preopens: Vec<(String, String)>,
-    /// Sandbox network namespace (`/proc/<pid>/ns/net`). Empty skips `setns`.
-    pub netns: String,
-    /// CRI memory limit in bytes. `0` leaves zwasm's default.
-    pub memory_limit_bytes: u64,
-    /// Image OS is wasip2 or wasip3. The guest exits before instantiation.
-    pub component: bool,
-}
+pub use oci_cri_zwasm::WasmRun;
 
-/// CRI runtime handler name advertised when the `zwasm` feature is enabled.
+/// CRI runtime handler name. Advertised when `oci-cri-zwasm` is installed.
 pub const HANDLER: &str = "zwasm";
 
 /// Image-config annotation used by crun and containerd-shim-wasm.
@@ -58,8 +36,8 @@ pub struct WasmChoice {
 
 /// Reject a sandbox handler this runtime does not implement.
 ///
-/// An empty handler is the native default. `zwasm` is accepted only when the
-/// crate is built with the `zwasm` feature.
+/// An empty handler is the native default. `zwasm` needs the `oci-cri-zwasm`
+/// runner beside the daemon or on `PATH`.
 pub fn check_handler(handler: &str) -> Result<()> {
     if handler.is_empty() {
         return Ok(());
@@ -71,14 +49,7 @@ pub fn check_handler(handler: &str) -> Result<()> {
             "",
         ));
     }
-    if !cfg!(feature = "zwasm") {
-        return Err(Error::new(
-            ErrorCode::Unsupported,
-            "runtime handler \"zwasm\" requires oci-cri built with the zwasm feature",
-            "",
-        ));
-    }
-    Ok(())
+    crate::wasm_host::require_helper()
 }
 
 /// Classify a workload container. `command` is the resolved argv, image
@@ -96,13 +67,6 @@ pub fn classify(
         || command_is_wasm(command);
     if !selected {
         return Ok(None);
-    }
-    if !cfg!(feature = "zwasm") {
-        return Err(Error::new(
-            ErrorCode::Unsupported,
-            "wasm workloads require oci-cri built with the zwasm feature",
-            "",
-        ));
     }
     Ok(Some(WasmChoice { component }))
 }
@@ -231,15 +195,6 @@ pub(crate) fn seal_module(
     Ok(placed)
 }
 
-/// Read a sealed module. A final symlink is an error.
-#[cfg_attr(not(feature = "zwasm"), allow(dead_code))]
-pub(crate) fn read_sealed(path: &std::path::Path) -> std::io::Result<Vec<u8>> {
-    let mut file = open_regular(path)?;
-    let mut bytes = Vec::new();
-    std::io::Read::read_to_end(&mut file, &mut bytes)?;
-    Ok(bytes)
-}
-
 fn destination_outside(
     root: &std::path::Path,
     dest: &std::path::Path,
@@ -350,6 +305,8 @@ mod tests {
     use super::*;
     use std::collections::BTreeMap;
 
+    use oci_cri_zwasm::read_sealed;
+
     fn image() -> ImageSpec {
         ImageSpec::default()
     }
@@ -375,12 +332,8 @@ mod tests {
 
     #[test]
     fn dot_wasm_command_selects_a_module() {
-        let choice = classify("", &image(), &["/hello.wasm".into()]);
-        if cfg!(feature = "zwasm") {
-            assert_eq!(choice.unwrap(), Some(WasmChoice { component: false }));
-        } else {
-            assert_eq!(choice.unwrap_err().code(), ErrorCode::Unsupported);
-        }
+        let choice = classify("", &image(), &["/hello.wasm".into()]).unwrap();
+        assert_eq!(choice, Some(WasmChoice { component: false }));
     }
 
     #[test]
@@ -389,19 +342,24 @@ mod tests {
         annotated
             .annotations
             .insert(VARIANT_ANNOTATION.into(), "compat".into());
-        assert!(classify("", &annotated, &[]).is_err() || cfg!(feature = "zwasm"));
+        assert_eq!(
+            classify("", &annotated, &[]).unwrap(),
+            Some(WasmChoice { component: false })
+        );
 
         let mut platform = image();
         platform.architecture = "wasm32".into();
-        assert!(matches!(classify("", &platform, &[]), Err(_) | Ok(Some(_))));
+        assert_eq!(
+            classify("", &platform, &[]).unwrap(),
+            Some(WasmChoice { component: false })
+        );
 
         let mut component = image();
         component.os = "wasip2".into();
-        match classify("", &component, &[]) {
-            Ok(Some(choice)) => assert!(choice.component),
-            Err(err) => assert_eq!(err.code(), ErrorCode::Unsupported),
-            Ok(None) => panic!("wasip2 must select wasm"),
-        }
+        assert_eq!(
+            classify("", &component, &[]).unwrap(),
+            Some(WasmChoice { component: true })
+        );
     }
 
     #[test]
