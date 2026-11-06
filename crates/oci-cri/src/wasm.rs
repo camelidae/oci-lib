@@ -143,14 +143,22 @@ pub fn resolved_command(command: &[String], args: &[String], image: &ImageSpec) 
 }
 
 /// Host path of the module inside an unpacked rootfs.
+///
+/// The program name must end in `.wasm`. The opened file, after resolving
+/// `..` and symlinks, must stay inside `rootfs`.
 #[must_use]
 pub fn module_path(rootfs: &str, argv: &[String]) -> Option<std::path::PathBuf> {
     let guest = argv.first()?;
     if !guest.ends_with(".wasm") {
         return None;
     }
+    let root = std::fs::canonicalize(rootfs).ok()?;
     let relative = guest.trim_start_matches('/');
-    Some(std::path::Path::new(rootfs).join(relative))
+    if relative.is_empty() || std::path::Path::new(relative).is_absolute() {
+        return None;
+    }
+    let opened = std::fs::canonicalize(root.join(relative)).ok()?;
+    opened.starts_with(&root).then_some(opened)
 }
 
 #[cfg(test)]
@@ -235,13 +243,36 @@ mod tests {
 
     #[test]
     fn module_path_joins_the_rootfs() {
-        let path = module_path("/var/root", &["/bin/app.wasm".into()]).unwrap();
-        assert_eq!(path, std::path::PathBuf::from("/var/root/bin/app.wasm"));
+        let dir = std::env::temp_dir().join(format!("wasm-mod-{}", std::process::id()));
+        let root = dir.join("root");
+        std::fs::create_dir_all(root.join("bin")).unwrap();
+        std::fs::write(root.join("bin/app.wasm"), b"\0asm").unwrap();
+        let path = module_path(&root.to_string_lossy(), &["/bin/app.wasm".into()]).unwrap();
+        assert_eq!(
+            path,
+            std::fs::canonicalize(root.join("bin/app.wasm")).unwrap()
+        );
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
     fn module_path_ignores_a_later_wasm_argument() {
         assert!(module_path("/var/root", &["/bin/tool".into(), "x.wasm".into()]).is_none());
+    }
+
+    #[test]
+    fn module_path_rejects_paths_outside_the_rootfs() {
+        let dir = std::env::temp_dir().join(format!("wasm-escape-{}", std::process::id()));
+        let root = dir.join("root");
+        std::fs::create_dir_all(&root).unwrap();
+        let outside = dir.join("outside.wasm");
+        std::fs::write(&outside, b"\0asm").unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&outside, root.join("link.wasm")).unwrap();
+        assert!(module_path(&root.to_string_lossy(), &["/../outside.wasm".into()]).is_none());
+        #[cfg(unix)]
+        assert!(module_path(&root.to_string_lossy(), &["/link.wasm".into()]).is_none());
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
