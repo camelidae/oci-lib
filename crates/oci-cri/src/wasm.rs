@@ -16,7 +16,8 @@ use crate::error::{Error, ErrorCode, Result};
 /// from stdin.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct WasmRun {
-    /// Unpacked module on the host.
+    /// Daemon-owned copy of the module, captured at create.
+    /// Later starts read this file and do not reopen the rootfs.
     pub module_path: std::path::PathBuf,
     /// Guest argv. The first entry is the program name.
     pub args: Vec<String>,
@@ -161,6 +162,185 @@ pub fn module_path(rootfs: &str, argv: &[String]) -> Option<std::path::PathBuf> 
     opened.starts_with(&root).then_some(opened)
 }
 
+/// Copy the module selected by [`module_path`] into `dest`.
+///
+/// Later starts execute this copy. `dest` must sit outside `rootfs`. The
+/// source is opened with `O_NOFOLLOW` after the confinement check, and it
+/// must be a regular file, so a swap to a symlink between the check and the
+/// read fails closed.
+pub(crate) fn seal_module(
+    rootfs: &str,
+    argv: &[String],
+    dest: &std::path::Path,
+) -> Result<std::path::PathBuf> {
+    let source = module_path(rootfs, argv).ok_or_else(|| {
+        Error::new(
+            ErrorCode::InvalidArgument,
+            "wasm container has no .wasm entrypoint",
+            "",
+        )
+    })?;
+    let root = std::fs::canonicalize(rootfs).map_err(|err| {
+        Error::new(
+            ErrorCode::InvalidArgument,
+            "wasm rootfs is not available",
+            err.to_string(),
+        )
+    })?;
+    let placed = destination_outside(&root, dest)?;
+    let parent = placed.parent().ok_or_else(|| {
+        Error::new(
+            ErrorCode::InvalidArgument,
+            "wasm module destination has no parent",
+            "",
+        )
+    })?;
+    std::fs::create_dir_all(parent).map_err(|err| {
+        Error::new(
+            ErrorCode::Internal,
+            "create wasm module directory",
+            err.to_string(),
+        )
+    })?;
+    let mut input = open_regular(&source).map_err(|err| {
+        Error::new(
+            ErrorCode::InvalidArgument,
+            "wasm module is not a regular file inside the rootfs",
+            err.to_string(),
+        )
+    })?;
+    let mut output = create_private(&placed).map_err(|err| {
+        Error::new(
+            ErrorCode::Internal,
+            "create sealed wasm module",
+            err.to_string(),
+        )
+    })?;
+    if let Err(err) = std::io::copy(&mut input, &mut output) {
+        let _ = std::fs::remove_file(&placed);
+        return Err(Error::new(
+            ErrorCode::Internal,
+            "copy sealed wasm module",
+            err.to_string(),
+        ));
+    }
+    Ok(placed)
+}
+
+/// Read a sealed module. A final symlink is an error.
+#[cfg_attr(not(feature = "zwasm"), allow(dead_code))]
+pub(crate) fn read_sealed(path: &std::path::Path) -> std::io::Result<Vec<u8>> {
+    let mut file = open_regular(path)?;
+    let mut bytes = Vec::new();
+    std::io::Read::read_to_end(&mut file, &mut bytes)?;
+    Ok(bytes)
+}
+
+fn destination_outside(
+    root: &std::path::Path,
+    dest: &std::path::Path,
+) -> Result<std::path::PathBuf> {
+    let name = dest
+        .file_name()
+        .filter(|name| *name != "." && *name != "..")
+        .ok_or_else(|| {
+            Error::new(
+                ErrorCode::InvalidArgument,
+                "wasm module destination has no file name",
+                "",
+            )
+        })?;
+    let mut suffix = Vec::new();
+    let mut cursor = dest.parent().unwrap_or(dest);
+    let existing = loop {
+        if cursor.as_os_str().is_empty() || cursor.exists() {
+            break cursor;
+        }
+        let Some(next) = cursor.parent().filter(|next| *next != cursor) else {
+            break cursor;
+        };
+        if let Some(component) = cursor.file_name() {
+            suffix.push(component.to_os_string());
+        }
+        cursor = next;
+    };
+    let mut placed = std::fs::canonicalize(existing).map_err(|err| {
+        Error::new(
+            ErrorCode::Internal,
+            "wasm module directory is not available",
+            err.to_string(),
+        )
+    })?;
+    if placed.starts_with(root) {
+        return Err(inside_rootfs());
+    }
+    for component in suffix.iter().rev() {
+        placed.push(component);
+        if placed.starts_with(root) {
+            return Err(inside_rootfs());
+        }
+    }
+    placed.push(name);
+    if placed.starts_with(root) {
+        Err(inside_rootfs())
+    } else {
+        Ok(placed)
+    }
+}
+
+fn inside_rootfs() -> Error {
+    Error::new(
+        ErrorCode::InvalidArgument,
+        "wasm module destination is inside the rootfs",
+        "",
+    )
+}
+
+fn open_regular(path: &std::path::Path) -> std::io::Result<std::fs::File> {
+    let file = open_nofollow(path)?;
+    if !file.metadata()?.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "not a regular file",
+        ));
+    }
+    Ok(file)
+}
+
+fn open_nofollow(path: &std::path::Path) -> std::io::Result<std::fs::File> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(path)
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::File::open(path)
+    }
+}
+
+fn create_private(path: &std::path::Path) -> std::io::Result<std::fs::File> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(path)
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -272,6 +452,63 @@ mod tests {
         assert!(module_path(&root.to_string_lossy(), &["/../outside.wasm".into()]).is_none());
         #[cfg(unix)]
         assert!(module_path(&root.to_string_lossy(), &["/link.wasm".into()]).is_none());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn seal_module_keeps_the_bytes_after_the_rootfs_changes() {
+        let dir = std::env::temp_dir().join(format!("wasm-seal-{}", std::process::id()));
+        let root = dir.join("root");
+        let store = dir.join("store");
+        std::fs::create_dir_all(root.join("bin")).unwrap();
+        std::fs::write(root.join("bin/app.wasm"), b"\0asm-v1").unwrap();
+        let dest = store.join("id.module");
+        let sealed =
+            seal_module(&root.to_string_lossy(), &["/bin/app.wasm".into()], &dest).unwrap();
+        assert_eq!(sealed, std::fs::canonicalize(&dest).unwrap());
+        std::fs::write(root.join("bin/app.wasm"), b"\0asm-v2").unwrap();
+        assert_eq!(read_sealed(&sealed).unwrap(), b"\0asm-v1");
+        let outside = dir.join("secret");
+        std::fs::write(&outside, b"secret-bytes").unwrap();
+        std::fs::remove_file(root.join("bin/app.wasm")).unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&outside, root.join("bin/app.wasm")).unwrap();
+        assert_eq!(read_sealed(&sealed).unwrap(), b"\0asm-v1");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn seal_module_rejects_a_destination_inside_the_rootfs() {
+        let dir = std::env::temp_dir().join(format!("wasm-seal-in-{}", std::process::id()));
+        let root = dir.join("root");
+        std::fs::create_dir_all(root.join("bin")).unwrap();
+        std::fs::write(root.join("bin/app.wasm"), b"\0asm").unwrap();
+        let err = seal_module(
+            &root.to_string_lossy(),
+            &["/bin/app.wasm".into()],
+            &root.join("bin/copy.module"),
+        )
+        .unwrap_err();
+        assert_eq!(
+            err.message(),
+            "wasm module destination is inside the rootfs"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn read_sealed_rejects_a_symlink() {
+        let dir = std::env::temp_dir().join(format!("wasm-sealed-link-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let real = dir.join("mod");
+        std::fs::write(&real, b"\0asm").unwrap();
+        assert_eq!(read_sealed(&real).unwrap(), b"\0asm");
+        #[cfg(unix)]
+        {
+            let link = dir.join("link");
+            std::os::unix::fs::symlink(&real, &link).unwrap();
+            assert!(read_sealed(&link).is_err());
+        }
         let _ = std::fs::remove_dir_all(dir);
     }
 

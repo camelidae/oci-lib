@@ -155,7 +155,7 @@ pub fn run_spec(spec: &WasmRun) -> i32 {
 }
 
 fn run_module(spec: &WasmRun) -> std::result::Result<i32, String> {
-    let bytes = std::fs::read(&spec.module_path)
+    let bytes = crate::wasm::read_sealed(&spec.module_path)
         .map_err(|err| format!("read {}: {err}", spec.module_path.display()))?;
     let engine = zwasm_sdk::Engine::new().map_err(|err| err.to_string())?;
     let mut store = zwasm_sdk::Store::new(&engine).map_err(|err| err.to_string())?;

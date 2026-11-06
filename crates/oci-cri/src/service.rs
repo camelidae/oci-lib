@@ -1430,13 +1430,6 @@ fn finish_wasm_container(
     argv: &[String],
     choice: crate::wasm::WasmChoice,
 ) -> CrateResult<String> {
-    let module = crate::wasm::module_path(&rootfs.to_string_lossy(), argv).ok_or_else(|| {
-        Error::new(
-            ErrorCode::InvalidArgument,
-            "wasm container has no .wasm entrypoint",
-            "",
-        )
-    })?;
     let mut preopens: Vec<(String, String)> = config
         .mounts
         .iter()
@@ -1468,6 +1461,11 @@ fn finish_wasm_container(
                 )
             })?
     };
+    let sealed = crate::wasm::seal_module(
+        &rootfs.to_string_lossy(),
+        argv,
+        &inner.config.root.join("wasm").join(format!("{id}.module")),
+    )?;
     let memory_limit_bytes = config
         .linux
         .as_ref()
@@ -1475,7 +1473,7 @@ fn finish_wasm_container(
         .map(|resources| resources.memory_limit_in_bytes)
         .unwrap_or(0);
     let spec = crate::wasm::WasmRun {
-        module_path: module,
+        module_path: sealed.clone(),
         args: argv.to_vec(),
         envs: wasm_environment(image, config),
         preopens,
@@ -1483,8 +1481,17 @@ fn finish_wasm_container(
         memory_limit_bytes: u64::try_from(memory_limit_bytes).unwrap_or(0),
         component: choice.component,
     };
-    let wasm_spec = serde_json::to_string(&spec)
-        .map_err(|err| Error::new(ErrorCode::Internal, "encode wasm spec", err.to_string()))?;
+    let wasm_spec = match serde_json::to_string(&spec) {
+        Ok(encoded) => encoded,
+        Err(err) => {
+            let _ = std::fs::remove_file(&sealed);
+            return Err(Error::new(
+                ErrorCode::Internal,
+                "encode wasm spec",
+                err.to_string(),
+            ));
+        }
+    };
     let message = if choice.component {
         "wasip2 and wasip3 modules need a component host; this runtime runs preview1 _start only"
             .to_string()
@@ -1551,7 +1558,10 @@ fn finish_wasm_container(
         host_pid: 0,
         wasm_spec,
     };
-    inner.store.put_container(record)?;
+    if let Err(err) = inner.store.put_container(record) {
+        let _ = std::fs::remove_file(&sealed);
+        return Err(err);
+    }
     inner.emit(id, ContainerEventType::ContainerCreatedEvent);
     Ok(id.to_string())
 }
@@ -1936,6 +1946,16 @@ pub(crate) fn remove_container_sync(inner: &Inner, id: &str) -> CrateResult<()> 
         .unwrap_or_else(|p| p.into_inner())
         .remove(id);
     inner.store.remove_container(id)?;
+    if crate::wasm::is_wasm_executor(&record.executor) {
+        let owned = inner.config.root.join("wasm");
+        if let Ok(spec) = serde_json::from_str::<crate::wasm::WasmRun>(&record.wasm_spec) {
+            let canonical = std::fs::canonicalize(&owned).unwrap_or_else(|_| owned.clone());
+            if spec.module_path.starts_with(&owned) || spec.module_path.starts_with(&canonical) {
+                let _ = std::fs::remove_file(spec.module_path);
+            }
+        }
+        let _ = std::fs::remove_file(owned.join(format!("{id}.module")));
+    }
     // Only remove runtime-owned fallback logs; kubelet owns explicit log paths.
     let fallback_log = inner.config.root.join("logs").join(format!("{id}.log"));
     if std::path::Path::new(&record.log_path) == fallback_log {
