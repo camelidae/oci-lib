@@ -35,6 +35,9 @@ pub mod server;
 pub mod service;
 pub mod store;
 pub mod streaming;
+mod wasm;
+#[cfg(feature = "zwasm")]
+mod wasm_host;
 
 mod ffi;
 #[cfg(rok_vm)]
@@ -67,6 +70,10 @@ pub use service::CriService;
 /// (`ROK_NO_SELF_SIGN=1` turns that off). On other platforms this is a no-op
 /// success (product layers may still refuse to serve).
 pub fn startup() -> Result<(), Error> {
+    #[cfg(feature = "zwasm")]
+    if std::env::var_os(wasm_host::RUN_ENV).is_some() {
+        std::process::exit(wasm_host::run_from_env());
+    }
     #[cfg(target_os = "linux")]
     {
         linux::startup()

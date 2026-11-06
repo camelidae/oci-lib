@@ -104,6 +104,15 @@ pub struct ImageSpec {
     /// Image labels.
     #[serde(default, deserialize_with = "null_as_default")]
     pub labels: BTreeMap<String, String>,
+    /// Image config annotations. `module.wasm.image/variant` selects WASI.
+    #[serde(default, deserialize_with = "null_as_default")]
+    pub annotations: BTreeMap<String, String>,
+    /// Image config OS (`linux`, `wasip1`, ...).
+    #[serde(default)]
+    pub os: String,
+    /// Image config architecture (`amd64`, `wasm32`, ...).
+    #[serde(default)]
+    pub architecture: String,
     /// Stop signal name.
     pub stop_signal: String,
 }

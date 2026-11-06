@@ -152,8 +152,11 @@ func convertImage(img *libimage.Image) (map[string]any, error) {
 			"entrypoint":  cfg.Entrypoint,
 			"cmd":         cfg.Cmd,
 			"working_dir": cfg.WorkingDir,
-			"labels":      cfg.Labels,
-			"stop_signal": cfg.StopSignal,
+			"labels":       cfg.Labels,
+			"stop_signal":  cfg.StopSignal,
+			"annotations":  data.Annotations,
+			"os":           data.Os,
+			"architecture": data.Architecture,
 		}
 		exposed := map[string]string{}
 		for port := range cfg.ExposedPorts {
