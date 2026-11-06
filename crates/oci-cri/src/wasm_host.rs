@@ -54,23 +54,38 @@ pub fn spawn(spec: &WasmRun, on_output: OutputSink) -> Result<WasmProcess> {
     })?;
     let mut child = Command::new(exe)
         .env(RUN_ENV, "1")
-        .stdin(Stdio::null())
+        .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
         .map_err(|err| Error::new(ErrorCode::Run, "spawn zwasm guest", err.to_string()))?;
-    {
-        let mut stdin = child
-            .stdin
-            .take()
-            .ok_or_else(|| Error::new(ErrorCode::Internal, "zwasm guest stdin missing", ""))?;
-        stdin
-            .write_all(&payload)
-            .map_err(|err| Error::new(ErrorCode::Run, "send wasm spec", err.to_string()))?;
+    if let Err(err) = send_spec_and_collect_output(&mut child, &payload, &on_output) {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(err);
     }
+    Ok(WasmProcess {
+        pid: child.id(),
+        child,
+    })
+}
+
+fn send_spec_and_collect_output(
+    child: &mut Child,
+    payload: &[u8],
+    on_output: &OutputSink,
+) -> Result<()> {
+    let mut stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| Error::new(ErrorCode::Internal, "zwasm guest stdin missing", ""))?;
+    stdin
+        .write_all(payload)
+        .map_err(|err| Error::new(ErrorCode::Run, "send wasm spec", err.to_string()))?;
+    drop(stdin);
     let pid = child.id();
     if let Some(stdout) = child.stdout.take() {
-        let sink = Arc::clone(&on_output);
+        let sink = Arc::clone(on_output);
         std::thread::Builder::new()
             .name(format!("zwasm-out-{pid}"))
             .spawn(move || copy_stream(stdout, 1, &sink))
@@ -79,7 +94,7 @@ pub fn spawn(spec: &WasmRun, on_output: OutputSink) -> Result<WasmProcess> {
             })?;
     }
     if let Some(stderr) = child.stderr.take() {
-        let sink = Arc::clone(&on_output);
+        let sink = Arc::clone(on_output);
         std::thread::Builder::new()
             .name(format!("zwasm-err-{pid}"))
             .spawn(move || copy_stream(stderr, 2, &sink))
@@ -87,7 +102,7 @@ pub fn spawn(spec: &WasmRun, on_output: OutputSink) -> Result<WasmProcess> {
                 Error::new(ErrorCode::Internal, "spawn stderr reader", err.to_string())
             })?;
     }
-    Ok(WasmProcess { pid, child })
+    Ok(())
 }
 
 fn copy_stream(mut reader: impl Read, stream: u8, sink: &OutputSink) {

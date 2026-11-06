@@ -122,7 +122,9 @@ fn platform_is_wasm(image: &ImageSpec) -> bool {
 }
 
 fn command_is_wasm(command: &[String]) -> bool {
-    command.iter().any(|arg| arg.ends_with(".wasm"))
+    command
+        .first()
+        .is_some_and(|program| program.ends_with(".wasm"))
 }
 
 /// Argv the guest sees: an explicit command, otherwise the image entrypoint
@@ -167,6 +169,13 @@ mod tests {
     fn unknown_handler_is_rejected() {
         let err = classify("wasmedge", &image(), &[]).unwrap_err();
         assert_eq!(err.code(), ErrorCode::InvalidArgument);
+    }
+
+    #[test]
+    fn a_wasm_argument_does_not_select_a_native_command() {
+        let choice =
+            classify("", &image(), &["cp".into(), "a.wasm".into(), "/dst".into()]).unwrap();
+        assert!(choice.is_none());
     }
 
     #[test]

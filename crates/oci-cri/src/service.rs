@@ -1396,6 +1396,30 @@ pub(crate) fn stop_pod_sandbox_sync(inner: &Inner, id: &str) -> CrateResult<()> 
     Ok(())
 }
 
+fn wasm_environment(image: &EngineImage, config: &ContainerConfig) -> Vec<(String, String)> {
+    let mut envs = Vec::new();
+    if let Some(spec) = &image.spec {
+        for item in &spec.env {
+            let Some((key, value)) = item.split_once('=') else {
+                continue;
+            };
+            if key.is_empty() {
+                continue;
+            }
+            envs.push((key.to_string(), value.to_string()));
+        }
+    }
+    for item in &config.envs {
+        let value = String::from_utf8_lossy(&item.value).into_owned();
+        if let Some(existing) = envs.iter_mut().find(|(key, _)| key == &item.key) {
+            existing.1 = value;
+        } else {
+            envs.push((item.key.clone(), value));
+        }
+    }
+    envs
+}
+
 #[allow(clippy::too_many_arguments)]
 fn finish_wasm_container(
     inner: &Inner,
@@ -1423,11 +1447,21 @@ fn finish_wasm_container(
     if !preopens.iter().any(|(_, guest)| guest == "/") {
         preopens.push((rootfs.to_string_lossy().into_owned(), "/".to_string()));
     }
-    let netns = inner
-        .namespace_paths(sandbox)
-        .ok()
-        .and_then(|paths| paths.network)
-        .unwrap_or_default();
+    let netns = if sandbox.host_network {
+        String::new()
+    } else {
+        inner
+            .namespace_paths(sandbox)?
+            .network
+            .filter(|path| !path.is_empty())
+            .ok_or_else(|| {
+                Error::new(
+                    ErrorCode::State,
+                    "sandbox network namespace is not available",
+                    "",
+                )
+            })?
+    };
     let memory_limit_bytes = config
         .linux
         .as_ref()
@@ -1437,16 +1471,7 @@ fn finish_wasm_container(
     let spec = crate::wasm::WasmRun {
         module_path: module,
         args: argv.to_vec(),
-        envs: config
-            .envs
-            .iter()
-            .map(|item| {
-                (
-                    item.key.clone(),
-                    String::from_utf8_lossy(&item.value).into_owned(),
-                )
-            })
-            .collect(),
+        envs: wasm_environment(image, config),
         preopens,
         netns,
         memory_limit_bytes: u64::try_from(memory_limit_bytes).unwrap_or(0),
