@@ -26,6 +26,9 @@ default = []
 vm = ["dep:oci-util", "oci-util/vm", "dep:dispatch2", "dep:objc2", "dep:objc2-virtualization"]
 # In-process fake engine used by the integration tests. Not for production.
 test-support = []
+# Preview1 WASI via zwasm-sdk. Needs Zig 0.16 on PATH at build time.
+# The node that runs the binary does not need Zig.
+zwasm = ["dep:zwasm-sdk"]
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }
@@ -41,6 +44,7 @@ futures-util = "0.3"
 base64 = "0.23.1"
 oci-spec = { version = "0.10", default-features = false, features = ["distribution"] }
 sha1 = "0.10"
+zwasm-sdk = { version = "0.4", optional = true }
 oci-util = { path = "../oci-util", version = "0.1.11", default-features = false, optional = true }
 
 [target.'cfg(any(target_os = "linux", target_os = "macos"))'.dependencies]

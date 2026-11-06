@@ -139,6 +139,9 @@ impl Inner {
     /// Reconcile a record with the engine (a container may have exited
     /// without the monitor noticing, e.g. across a daemon restart).
     fn reconcile(&self, mut record: ContainerRecord) -> ContainerRecord {
+        if crate::wasm::is_wasm_executor(&record.executor) {
+            return record;
+        }
         if record.state == StoredState::Running {
             if let Ok(state) = self.engine.container_state(&record.id) {
                 if state.status == "stopped" || state.status == "created" {
@@ -239,6 +242,35 @@ impl Inner {
             })
             .ok();
     }
+
+    #[cfg(feature = "zwasm")]
+    fn spawn_exit_monitor<F>(&self, container_id: String, wait: F)
+    where
+        F: FnOnce(&str) -> i32 + Send + 'static,
+    {
+        let store = Arc::clone(&self.store);
+        let inner = self.events.clone();
+        std::thread::Builder::new()
+            .name(format!("rok-wait-{container_id}"))
+            .spawn(move || {
+                let code = wait(&container_id);
+                if let Some(mut record) = store.container(&container_id) {
+                    record.state = StoredState::Exited;
+                    record.exit_code = code;
+                    record.finished_at_ns = now_ns();
+                    record.reason = exit_reason(code, false).into();
+                    let _ = store.put_container(record);
+                }
+                let _ = inner.send(ContainerEventResponse {
+                    container_id: container_id.clone(),
+                    container_event_type: ContainerEventType::ContainerStoppedEvent as i32,
+                    created_at: now_ns(),
+                    pod_sandbox_status: None,
+                    containers_statuses: Vec::new(),
+                });
+            })
+            .ok();
+    }
 }
 
 fn exit_reason(code: i32, oom_killed: bool) -> &'static str {
@@ -295,7 +327,7 @@ fn sandbox_status(record: &SandboxRecord) -> PodSandboxStatus {
         }),
         labels: hashmap(&record.labels),
         annotations: hashmap(&record.annotations),
-        runtime_handler: String::new(),
+        runtime_handler: record.runtime_handler.clone(),
     }
 }
 
@@ -354,6 +386,23 @@ fn container_status(record: &ContainerRecord) -> ContainerStatus {
             }),
         stop_signal: signal_number(&record.stop_signal),
     }
+}
+
+fn runtime_handlers() -> Vec<RuntimeHandler> {
+    let mut handlers = vec![RuntimeHandler {
+        name: String::new(),
+        features: Some(RuntimeHandlerFeatures {
+            recursive_read_only_mounts: true,
+            user_namespaces: false,
+        }),
+    }];
+    if cfg!(feature = "zwasm") {
+        handlers.push(RuntimeHandler {
+            name: crate::wasm::HANDLER.to_string(),
+            features: Some(RuntimeHandlerFeatures::default()),
+        });
+    }
+    handlers
 }
 
 fn container_summary(record: &ContainerRecord) -> Container {
@@ -514,7 +563,7 @@ impl RuntimeService for CriService {
                 created_at: s.created_at_ns,
                 labels: hashmap(&s.labels),
                 annotations: hashmap(&s.annotations),
-                runtime_handler: String::new(),
+                runtime_handler: s.runtime_handler.clone(),
             })
             .collect();
         Ok(Response::new(ListPodSandboxResponse { items }))
@@ -683,6 +732,13 @@ impl RuntimeService for CriService {
     ) -> std::result::Result<Response<ExecSyncResponse>, Status> {
         let inner = Arc::clone(&self.inner);
         let request = request.into_inner();
+        if let Some(record) = inner.store.container(&request.container_id)
+            && crate::wasm::is_wasm_executor(&record.executor)
+        {
+            return Err(Status::unimplemented(
+                "exec is not supported for wasm containers",
+            ));
+        }
         let output = tokio::task::spawn_blocking(move || {
             inner
                 .engine
@@ -703,10 +759,15 @@ impl RuntimeService for CriService {
         request: Request<ExecRequest>,
     ) -> std::result::Result<Response<ExecResponse>, Status> {
         let request = request.into_inner();
-        let _ = self
+        let record = self
             .inner
             .container_record(&request.container_id)
             .map_err(Status::from)?;
+        if crate::wasm::is_wasm_executor(&record.executor) {
+            return Err(Status::unimplemented(
+                "exec is not supported for wasm containers",
+            ));
+        }
         let url = self.inner.streaming.url(
             "exec",
             SessionKind::Exec {
@@ -730,6 +791,11 @@ impl RuntimeService for CriService {
             .inner
             .container_record(&request.container_id)
             .map_err(Status::from)?;
+        if crate::wasm::is_wasm_executor(&record.executor) {
+            return Err(Status::unimplemented(
+                "attach is not supported for wasm containers",
+            ));
+        }
         let url = self.inner.streaming.url(
             "attach",
             SessionKind::Attach {
@@ -942,13 +1008,7 @@ impl RuntimeService for CriService {
             } else {
                 HashMap::new()
             },
-            runtime_handlers: vec![RuntimeHandler {
-                name: String::new(),
-                features: Some(RuntimeHandlerFeatures {
-                    recursive_read_only_mounts: true,
-                    user_namespaces: false,
-                }),
-            }],
+            runtime_handlers: runtime_handlers(),
             features: Some(RuntimeFeatures {
                 supplemental_groups_policy: true,
                 user_namespaces_host_network: false,
@@ -1197,6 +1257,8 @@ pub(crate) fn run_pod_sandbox_sync(
     inner: &Inner,
     request: RunPodSandboxRequest,
 ) -> CrateResult<String> {
+    crate::wasm::check_handler(&request.runtime_handler)?;
+    let runtime_handler = request.runtime_handler.clone();
     let config = request
         .config
         .ok_or_else(|| Error::new(ErrorCode::InvalidArgument, "sandbox config is missing", ""))?;
@@ -1251,6 +1313,7 @@ pub(crate) fn run_pod_sandbox_sync(
         host_network,
         linux_json: format!("{:?}", config.linux),
         log_directory: config.log_directory.clone(),
+        runtime_handler,
     };
     if !host_network && network::configured(&inner.config) {
         let state = inner.engine.container_state(&infra_id)?;
@@ -1333,6 +1396,224 @@ pub(crate) fn stop_pod_sandbox_sync(inner: &Inner, id: &str) -> CrateResult<()> 
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
+fn finish_wasm_container(
+    inner: &Inner,
+    sandbox: &SandboxRecord,
+    config: &ContainerConfig,
+    image: &EngineImage,
+    requested_image: &str,
+    id: &str,
+    rootfs: &std::path::Path,
+    argv: &[String],
+    choice: crate::wasm::WasmChoice,
+) -> CrateResult<String> {
+    let module = crate::wasm::module_path(&rootfs.to_string_lossy(), argv).ok_or_else(|| {
+        Error::new(
+            ErrorCode::InvalidArgument,
+            "wasm container has no .wasm entrypoint",
+            "",
+        )
+    })?;
+    let mut preopens: Vec<(String, String)> = config
+        .mounts
+        .iter()
+        .map(|mount| (mount.host_path.clone(), mount.container_path.clone()))
+        .collect();
+    if !preopens.iter().any(|(_, guest)| guest == "/") {
+        preopens.push((rootfs.to_string_lossy().into_owned(), "/".to_string()));
+    }
+    let netns = inner
+        .namespace_paths(sandbox)
+        .ok()
+        .and_then(|paths| paths.network)
+        .unwrap_or_default();
+    let memory_limit_bytes = config
+        .linux
+        .as_ref()
+        .and_then(|linux| linux.resources.as_ref())
+        .map(|resources| resources.memory_limit_in_bytes)
+        .unwrap_or(0);
+    let spec = crate::wasm::WasmRun {
+        module_path: module,
+        args: argv.to_vec(),
+        envs: config
+            .envs
+            .iter()
+            .map(|item| {
+                (
+                    item.key.clone(),
+                    String::from_utf8_lossy(&item.value).into_owned(),
+                )
+            })
+            .collect(),
+        preopens,
+        netns,
+        memory_limit_bytes: u64::try_from(memory_limit_bytes).unwrap_or(0),
+        component: choice.component,
+    };
+    let wasm_spec = serde_json::to_string(&spec)
+        .map_err(|err| Error::new(ErrorCode::Internal, "encode wasm spec", err.to_string()))?;
+    let message = if choice.component {
+        "wasip2 and wasip3 modules need a component host; this runtime runs preview1 _start only"
+            .to_string()
+    } else {
+        String::new()
+    };
+    let metadata = config.metadata.clone().unwrap_or_default();
+    let log_path = if config.log_path.is_empty() {
+        inner
+            .config
+            .root
+            .join("logs")
+            .join(format!("{id}.log"))
+            .to_string_lossy()
+            .into_owned()
+    } else {
+        format!(
+            "{}/{}",
+            sandbox.log_directory.trim_end_matches('/'),
+            config.log_path
+        )
+    };
+    let record = ContainerRecord {
+        id: id.to_string(),
+        sandbox_id: sandbox.id.clone(),
+        metadata: StoredMetadata {
+            name: metadata.name.clone(),
+            uid: String::new(),
+            namespace: String::new(),
+            attempt: metadata.attempt,
+        },
+        image: requested_image.to_string(),
+        image_ref: image
+            .repo_digests
+            .first()
+            .cloned()
+            .unwrap_or_else(|| requested_image.to_string()),
+        labels: config
+            .labels
+            .iter()
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect(),
+        annotations: config
+            .annotations
+            .iter()
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect(),
+        log_path,
+        tty: config.tty,
+        stdin: config.stdin,
+        stdin_once: config.stdin_once,
+        state: StoredState::Created,
+        created_at_ns: now_ns(),
+        started_at_ns: 0,
+        finished_at_ns: 0,
+        exit_code: -1,
+        reason: String::new(),
+        message,
+        spec_json: String::new(),
+        config_bytes: config.encode_to_vec(),
+        rootfs: rootfs.to_string_lossy().into_owned(),
+        stop_signal: String::new(),
+        executor: crate::wasm::EXECUTOR_WASM.to_string(),
+        host_pid: 0,
+        wasm_spec,
+    };
+    inner.store.put_container(record)?;
+    inner.emit(id, ContainerEventType::ContainerCreatedEvent);
+    Ok(id.to_string())
+}
+
+fn stop_wasm_container(
+    inner: &Inner,
+    record: &ContainerRecord,
+    timeout_secs: i64,
+) -> CrateResult<()> {
+    let pid = record.host_pid;
+    if pid > 0 {
+        let first = if timeout_secs <= 0 { 9 } else { 15 };
+        signal_pid(pid, first);
+        if timeout_secs > 0 {
+            let deadline = std::time::Instant::now() + Duration::from_secs(timeout_secs as u64);
+            loop {
+                match inner.store.container(&record.id) {
+                    Some(current) if current.state != StoredState::Running => break,
+                    _ if std::time::Instant::now() >= deadline => {
+                        signal_pid(pid, 9);
+                        break;
+                    }
+                    _ => std::thread::sleep(Duration::from_millis(25)),
+                }
+            }
+        }
+    }
+    for _ in 0..80 {
+        match inner.store.container(&record.id) {
+            Some(current) if current.state != StoredState::Running => return Ok(()),
+            _ => std::thread::sleep(Duration::from_millis(25)),
+        }
+    }
+    if let Some(mut current) = inner.store.container(&record.id)
+        && current.state == StoredState::Running
+    {
+        current.state = StoredState::Exited;
+        current.exit_code = 137;
+        current.finished_at_ns = now_ns();
+        current.reason = "Error".into();
+        let _ = inner.store.put_container(current);
+    }
+    Ok(())
+}
+
+fn signal_pid(pid: i32, signal: i32) {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    // SAFETY: `kill` only delivers `signal` to `pid`. A stale pid is reported
+    // by the return value, which this stop path ignores.
+    unsafe {
+        libc::kill(pid, signal);
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let _ = (pid, signal);
+    }
+}
+
+#[cfg(not(feature = "zwasm"))]
+fn start_wasm_container(
+    inner: &Inner,
+    record: ContainerRecord,
+    sink: crate::engine::OutputSink,
+) -> CrateResult<()> {
+    let _ = (inner, record, sink);
+    Err(Error::new(
+        ErrorCode::Unsupported,
+        "wasm workloads require oci-cri built with the zwasm feature",
+        "",
+    ))
+}
+
+#[cfg(feature = "zwasm")]
+fn start_wasm_container(
+    inner: &Inner,
+    mut record: ContainerRecord,
+    sink: crate::engine::OutputSink,
+) -> CrateResult<()> {
+    let spec: crate::wasm::WasmRun = serde_json::from_str(&record.wasm_spec)
+        .map_err(|err| Error::new(ErrorCode::Internal, "decode wasm spec", err.to_string()))?;
+    let process = crate::wasm_host::spawn(&spec, sink)?;
+    let id = record.id.clone();
+    record.host_pid = i32::try_from(process.pid).unwrap_or(0);
+    record.state = StoredState::Running;
+    record.started_at_ns = now_ns();
+    record.finished_at_ns = 0;
+    record.exit_code = -1;
+    inner.store.put_container(record)?;
+    inner.spawn_exit_monitor(id.clone(), move |_| process.wait());
+    inner.emit(&id, ContainerEventType::ContainerStartedEvent);
+    Ok(())
+}
+
 pub(crate) fn create_container_sync(
     inner: &Inner,
     request: CreateContainerRequest,
@@ -1357,8 +1638,27 @@ pub(crate) fn create_container_sync(
         .as_ref()
         .ok_or_else(|| Error::new(ErrorCode::InvalidArgument, "container image is missing", ""))?;
     let image = inner.find_image(&image_spec.image)?;
+    let image_config = image.spec.clone().unwrap_or_default();
+    let argv = crate::wasm::resolved_command(&config.command, &config.args, &image_config);
+    let wasm = crate::wasm::classify(&sandbox.runtime_handler, &image_config, &argv)?;
     let id = new_id();
     let rootfs = inner.engine.prepare_rootfs(&id, &image.id)?;
+    if let Some(choice) = wasm {
+        return finish_wasm_container(
+            inner,
+            &sandbox,
+            &config,
+            &image,
+            &image_spec.image,
+            &id,
+            &rootfs,
+            &argv,
+            choice,
+        )
+        .inspect_err(|_| {
+            let _ = inner.engine.release_rootfs(&id);
+        });
+    }
     let spec_json = (|| -> CrateResult<String> {
         let mut namespace_paths = inner.namespace_paths(&sandbox)?;
         // Per-container namespace modes: NODE means host namespace (no join).
@@ -1477,6 +1777,9 @@ pub(crate) fn create_container_sync(
             .as_ref()
             .map(|s| s.stop_signal.clone())
             .unwrap_or_default(),
+        executor: String::new(),
+        host_pid: 0,
+        wasm_spec: String::new(),
     };
     inner.store.put_container(record)?;
     inner.emit(&id, ContainerEventType::ContainerCreatedEvent);
@@ -1504,6 +1807,9 @@ pub(crate) fn start_container_sync(inner: &Inner, id: &str) -> CrateResult<()> {
             .insert(id.to_string(), Arc::clone(&writer));
         Arc::new(move |stream, data| writer.write(stream, data))
     };
+    if crate::wasm::is_wasm_executor(&record.executor) {
+        return start_wasm_container(inner, record, sink);
+    }
     inner.engine.start_container(id, sink)?;
     record.state = StoredState::Running;
     record.started_at_ns = now_ns();
@@ -1523,6 +1829,13 @@ pub(crate) fn stop_container_sync(inner: &Inner, id: &str, timeout_secs: i64) ->
     };
     if record.state != StoredState::Running {
         return Ok(()); // idempotent
+    }
+    if crate::wasm::is_wasm_executor(&record.executor) {
+        let result = stop_wasm_container(inner, &record, timeout_secs);
+        if let Some(writer) = inner.logs.read().unwrap_or_else(|p| p.into_inner()).get(id) {
+            writer.flush_partial();
+        }
+        return result;
     }
     let signal = if record.stop_signal.is_empty() {
         15
@@ -1582,7 +1895,9 @@ pub(crate) fn remove_container_sync(inner: &Inner, id: &str) -> CrateResult<()> 
     if record.state == StoredState::Running {
         let _ = stop_container_sync(inner, id, 0);
     }
-    let _ = inner.engine.remove_container(id);
+    if !crate::wasm::is_wasm_executor(&record.executor) {
+        let _ = inner.engine.remove_container(id);
+    }
     let _ = inner.engine.release_rootfs(id);
     inner
         .logs
@@ -1887,6 +2202,7 @@ mod tests {
             host_network: false,
             linux_json: String::new(),
             log_directory: String::new(),
+            runtime_handler: String::new(),
         }
     }
 
@@ -1928,6 +2244,9 @@ mod tests {
             config_bytes: Vec::new(),
             rootfs: String::new(),
             stop_signal: String::new(),
+            executor: String::new(),
+            host_pid: 0,
+            wasm_spec: String::new(),
         }
     }
 
