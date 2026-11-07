@@ -146,7 +146,9 @@ func opCreate(req *opRequest) error {
 		return fail(codeRun, "container config", err.Error())
 	}
 	var st syscall.Statfs_t
-	if syscall.Statfs("/", &st) == nil && st.Type == 0x858458f6 {
+	// An initramfs rootfs can be backed by either ramfs or tmpfs. Linux
+	// cannot pivot_root away from rootfs; use libcontainer's move/chroot path.
+	if syscall.Statfs("/", &st) == nil && (st.Type == 0x858458f6 || st.Type == 0x01021994) {
 		config.NoPivotRoot = true
 	}
 	container, err := libcontainer.Create(stateRootOf(req), req.ID, config)

@@ -1,0 +1,4 @@
+# The runner is a standalone executable, not a containerd shim.
+[runtimes.wasmtime]
+runtime_path = "/usr/local/bin/oci-wasip3"
+platform = "wasip3/wasm32"

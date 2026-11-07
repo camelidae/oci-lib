@@ -31,6 +31,8 @@ pub fn engine_serve() -> Result<i32, Error> {
     std::fs::create_dir_all("/run/oci-cri").map_err(io_err)?;
 
     let config = Config {
+        runtime_config_dir: Some(PathBuf::from("/etc/oci-cri/config.d")),
+        runtimes: Default::default(),
         runtime_name: crate::config::RUNTIME_NAME.to_string(),
         socket: socket.clone(),
         root: root.clone(),

@@ -116,3 +116,6 @@ unsafe extern "C" {
 #[cfg(target_os = "linux")]
 #[used]
 static ROK_NSEXEC_KEEP: unsafe extern "C" fn() -> i32 = rok_nsexec_keep;
+
+/// TOML-configured executable runtime handlers.
+pub mod runtime_plugin;

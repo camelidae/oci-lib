@@ -41,6 +41,9 @@ pub enum SandboxState {
 /// One persisted pod sandbox.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SandboxRecord {
+    /// Runtime handler inherited by containers; absent in older records means native.
+    #[serde(default)]
+    pub runtime_handler: String,
     /// CRI sandbox ID.
     pub id: String,
     /// Pod metadata.
@@ -387,6 +390,7 @@ mod tests {
 
     fn sandbox(id: &str) -> SandboxRecord {
         SandboxRecord {
+            runtime_handler: String::new(),
             id: id.into(),
             metadata: Metadata {
                 name: "pod".into(),

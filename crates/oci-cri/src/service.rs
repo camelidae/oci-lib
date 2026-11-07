@@ -84,7 +84,21 @@ impl CriService {
     }
 
     /// Open the store from the config and create a service.
-    pub fn open(config: Config, engine: Arc<dyn Engine>) -> CrateResult<Self> {
+    pub fn open(mut config: Config, engine: Arc<dyn Engine>) -> CrateResult<Self> {
+        if let Some(directory) = &config.runtime_config_dir {
+            for (name, runtime) in crate::runtime_plugin::load(directory)? {
+                if config.runtimes.insert(name.clone(), runtime).is_some() {
+                    return Err(Error::new(
+                        ErrorCode::InvalidArgument,
+                        "duplicate runtime handler",
+                        name,
+                    ));
+                }
+            }
+        }
+        for runtime in config.runtimes.values() {
+            runtime.validate()?;
+        }
         let store = Arc::new(Store::open(
             config.sandboxes_dir(),
             config.containers_dir(),
@@ -295,7 +309,7 @@ fn sandbox_status(record: &SandboxRecord) -> PodSandboxStatus {
         }),
         labels: hashmap(&record.labels),
         annotations: hashmap(&record.annotations),
-        runtime_handler: String::new(),
+        runtime_handler: record.runtime_handler.clone(),
     }
 }
 
@@ -514,7 +528,7 @@ impl RuntimeService for CriService {
                 created_at: s.created_at_ns,
                 labels: hashmap(&s.labels),
                 annotations: hashmap(&s.annotations),
-                runtime_handler: String::new(),
+                runtime_handler: s.runtime_handler.clone(),
             })
             .collect();
         Ok(Response::new(ListPodSandboxResponse { items }))
@@ -942,13 +956,16 @@ impl RuntimeService for CriService {
             } else {
                 HashMap::new()
             },
-            runtime_handlers: vec![RuntimeHandler {
-                name: String::new(),
-                features: Some(RuntimeHandlerFeatures {
-                    recursive_read_only_mounts: true,
-                    user_namespaces: false,
-                }),
-            }],
+            runtime_handlers: std::iter::once(String::new())
+                .chain(self.inner.config.runtimes.keys().cloned())
+                .map(|name| RuntimeHandler {
+                    name,
+                    features: Some(RuntimeHandlerFeatures {
+                        recursive_read_only_mounts: true,
+                        user_namespaces: false,
+                    }),
+                })
+                .collect(),
             features: Some(RuntimeFeatures {
                 supplemental_groups_policy: true,
                 user_namespaces_host_network: false,
@@ -1197,6 +1214,7 @@ pub(crate) fn run_pod_sandbox_sync(
     inner: &Inner,
     request: RunPodSandboxRequest,
 ) -> CrateResult<String> {
+    crate::runtime_plugin::resolve(&inner.config, &request.runtime_handler)?;
     let config = request
         .config
         .ok_or_else(|| Error::new(ErrorCode::InvalidArgument, "sandbox config is missing", ""))?;
@@ -1226,6 +1244,7 @@ pub(crate) fn run_pod_sandbox_sync(
     let log_writer: crate::engine::OutputSink = Arc::new(|_, _| {});
     inner.engine.start_container(&infra_id, log_writer)?;
     let mut record = SandboxRecord {
+        runtime_handler: request.runtime_handler,
         id: sandbox_id.clone(),
         metadata: StoredMetadata {
             name: metadata.name.clone(),
@@ -1357,6 +1376,14 @@ pub(crate) fn create_container_sync(
         .as_ref()
         .ok_or_else(|| Error::new(ErrorCode::InvalidArgument, "container image is missing", ""))?;
     let image = inner.find_image(&image_spec.image)?;
+    let plugin = crate::runtime_plugin::resolve(&inner.config, &sandbox.runtime_handler)?;
+    if !crate::runtime_plugin::matches_image(plugin, &image) {
+        return Err(Error::new(
+            ErrorCode::InvalidArgument,
+            "image platform does not match runtime handler",
+            &sandbox.runtime_handler,
+        ));
+    }
     let id = new_id();
     let rootfs = inner.engine.prepare_rootfs(&id, &image.id)?;
     let spec_json = (|| -> CrateResult<String> {
@@ -1402,6 +1429,9 @@ pub(crate) fn create_container_sync(
             .map_err(|e| Error::new(ErrorCode::Internal, e.to_string(), ""))?;
         spec["process"]["user"] = serde_json::to_value(user)
             .map_err(|e| Error::new(ErrorCode::Internal, e.to_string(), ""))?;
+        if let Some(plugin) = plugin {
+            plugin.apply(&mut spec)?;
+        }
         crate::dns::mount(spec.to_string(), &inner.config.root, &sandbox.id)
     })();
     let spec_json = match spec_json {
@@ -1866,6 +1896,7 @@ mod tests {
             labels.insert(k.into(), v.into());
         }
         SandboxRecord {
+            runtime_handler: String::new(),
             id: id.into(),
             metadata: StoredMetadata {
                 name: "pod".into(),
@@ -2227,5 +2258,94 @@ mod dns_regressions {
             .unwrap();
             assert!(!std::path::Path::new(source).exists());
         }
+    }
+}
+
+#[cfg(all(test, unix))]
+mod runtime_plugin_tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn sandbox_handler_survives_reload_and_wraps_only_wasi_workloads() {
+        let dir = tempfile::tempdir().unwrap();
+        let conf = dir.path().join("config.d");
+        std::fs::create_dir(&conf).unwrap();
+        let runner = dir.path().join("runner");
+        std::fs::write(&runner, "fixture").unwrap();
+        std::fs::set_permissions(&runner, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::write(
+            conf.join("wasmtime.toml"),
+            format!(
+                "[runtimes.wasmtime]\nruntime_path = {:?}\nplatform = 'wasip3/wasm32'\n",
+                runner
+            ),
+        )
+        .unwrap();
+        let config = Config {
+            root: dir.path().join("root"),
+            runtime_config_dir: Some(conf),
+            ..Config::default()
+        };
+        let engine = Arc::new(crate::test_support::FakeEngine::new(config.root.clone()));
+        engine.insert_image(crate::engine::EngineImage {
+            id: "wasm-image".into(),
+            os: "wasip3".into(),
+            architecture: "wasm32".into(),
+            spec: Some(crate::engine::ImageSpec {
+                entrypoint: vec!["/probe.wasm".into()],
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        let service = CriService::open(config.clone(), engine.clone()).unwrap();
+        assert!(
+            run_pod_sandbox_sync(
+                &service.inner,
+                RunPodSandboxRequest {
+                    runtime_handler: "missing".into(),
+                    ..Default::default()
+                }
+            )
+            .is_err()
+        );
+        let sandbox = run_pod_sandbox_sync(
+            &service.inner,
+            RunPodSandboxRequest {
+                runtime_handler: "wasmtime".into(),
+                config: Some(PodSandboxConfig::default()),
+            },
+        )
+        .unwrap();
+        let service = CriService::open(config, engine).unwrap();
+        let record = service.inner.sandbox_record(&sandbox).unwrap();
+        assert_eq!(sandbox_status(&record).runtime_handler, "wasmtime");
+        let created = create_container_sync(
+            &service.inner,
+            CreateContainerRequest {
+                pod_sandbox_id: sandbox.clone(),
+                config: Some(ContainerConfig {
+                    image: Some(ImageSpec {
+                        image: "wasm-image".into(),
+                        ..Default::default()
+                    }),
+                    args: vec!["hello".into()],
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        );
+        stop_pod_sandbox_sync(&service.inner, &sandbox).unwrap();
+        let id = created.unwrap();
+        let record = service.inner.container_record(&id).unwrap();
+        let spec: serde_json::Value = serde_json::from_str(&record.spec_json).unwrap();
+        assert_eq!(
+            spec["process"]["args"],
+            serde_json::json!(["/run/oci-cri-runtime", "/probe.wasm", "hello"])
+        );
+        assert_eq!(
+            spec["mounts"].as_array().unwrap().last().unwrap()["destination"],
+            "/run/oci-cri-runtime"
+        );
     }
 }

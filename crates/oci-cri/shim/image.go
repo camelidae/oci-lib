@@ -114,7 +114,16 @@ func opPullImage(req *opRequest) (any, error) {
 	if err != nil {
 		return nil, err
 	}
-	pulled, err := rt.Pull(ctx(), req.Image, config.PullPolicyMissing, &libimage.PullOptions{})
+	options := &libimage.PullOptions{}
+	if req.Platform != "" {
+		parts := strings.Split(req.Platform, "/")
+		if len(parts) != 2 {
+			return nil, fail(codeInvalid, "invalid runtime platform", req.Platform)
+		}
+		options.OS, options.Architecture = parts[0], parts[1]
+	}
+	// CRI PullImage is an explicit pull; kubelet already applied the pull policy.
+	pulled, err := rt.Pull(ctx(), req.Image, config.PullPolicyAlways, options)
 	if err != nil {
 		return nil, fail(codeRun, "pull image", err.Error())
 	}
@@ -145,6 +154,7 @@ func convertImage(img *libimage.Image) (map[string]any, error) {
 		"size":         uint64(size),
 	}
 	if data, err := img.Inspect(ctx(), &libimage.InspectOptions{}); err == nil && data.Config != nil {
+		out["os"], out["architecture"] = data.Os, data.Architecture
 		cfg := data.Config
 		spec := map[string]any{
 			"user":        cfg.User,

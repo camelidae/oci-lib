@@ -268,6 +268,20 @@ impl Engine for LinuxEngine {
         Ok(value["image_ref"].as_str().unwrap_or_default().to_string())
     }
 
+    fn pull_image_for_platform(
+        &self,
+        image: &str,
+        auth: Option<&Auth>,
+        insecure: bool,
+        platform: Option<&str>,
+    ) -> Result<String> {
+        let value = self.call(json!({
+            "op": "pull_image", "image": image, "auth": auth, "insecure": insecure,
+            "platform": platform.unwrap_or_default(),
+        }))?;
+        Ok(value["image_ref"].as_str().unwrap_or_default().to_string())
+    }
+
     fn list_images(&self, filter: &str) -> Result<Vec<EngineImage>> {
         let value = self.call(json!({"op": "list_images", "filter": filter}))?;
         parse(value["images"].clone())

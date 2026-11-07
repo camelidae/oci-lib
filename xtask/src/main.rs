@@ -101,6 +101,18 @@ fn guest(packages: &[String]) -> Result<()> {
         );
         archive.file(package, 0o755, read(&bin)?);
         add_shared_libraries(&mut archive, &bin, package)?;
+        if package == "oci-cri" {
+            run(Command::new("sh")
+                .arg(root.join("scripts/build-wasip3.sh"))
+                .current_dir(&root))?;
+            let runner = target_dir.join("release/oci-wasip3");
+            archive.file("usr/local/bin/oci-wasip3", 0o755, read(&runner)?);
+            archive.file(
+                "etc/oci-cri/config.d/wasmtime.toml",
+                0o644,
+                include_bytes!("../../crates/oci-cri/config.d/wasmtime.toml").to_vec(),
+            );
+        }
 
         let initramfs = out.join("initramfs");
         // Hash the gzip bytes just written, not the uncompressed cpio. That is

@@ -38,6 +38,12 @@ pub struct Auth {
 /// One image in the local store.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct EngineImage {
+    /// OCI platform from the image config.
+    #[serde(default)]
+    pub os: String,
+    /// OCI architecture from the image config.
+    #[serde(default)]
+    pub architecture: String,
     /// Storage image ID.
     pub id: String,
     /// Tagged names pointing at the image.
@@ -214,6 +220,24 @@ pub trait Engine: Send + Sync {
     /// Pull `image` (with optional credentials) and return its canonical
     /// reference/digest string for status replies.
     fn pull_image(&self, image: &str, auth: Option<&Auth>, insecure: bool) -> Result<String>;
+
+    /// Pull a runtime's platform. Engines must opt in to non-native platforms.
+    fn pull_image_for_platform(
+        &self,
+        image: &str,
+        auth: Option<&Auth>,
+        insecure: bool,
+        platform: Option<&str>,
+    ) -> Result<String> {
+        if platform.is_some() {
+            return Err(crate::Error::new(
+                crate::ErrorCode::Unsupported,
+                "engine does not support runtime platforms",
+                "",
+            ));
+        }
+        self.pull_image(image, auth, insecure)
+    }
 
     /// List images, optionally filtered to one reference.
     fn list_images(&self, filter: &str) -> Result<Vec<EngineImage>>;

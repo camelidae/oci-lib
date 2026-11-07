@@ -87,6 +87,9 @@ enum Command {
 /// Flags shared by `serve` and `diagnose`.
 #[derive(Debug, Clone, Args)]
 struct RuntimeArgs {
+    /// Directory of executable runtime handler TOML files.
+    #[arg(long, default_value = "/etc/oci-cri/config.d")]
+    runtime_config_dir: PathBuf,
     /// CRI unix socket path.
     #[arg(long, default_value = "/run/oci-cri/oci-cri.sock")]
     socket: PathBuf,
@@ -122,6 +125,8 @@ struct RuntimeArgs {
 impl RuntimeArgs {
     fn into_config(self) -> Config {
         Config {
+            runtime_config_dir: Some(self.runtime_config_dir),
+            runtimes: Default::default(),
             runtime_name: oci_cri::config::RUNTIME_NAME.to_string(),
             socket: self.socket,
             root: self.root,

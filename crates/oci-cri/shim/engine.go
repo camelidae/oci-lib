@@ -66,6 +66,7 @@ type opRequest struct {
 	StateRoot string          `json:"state_root"`
 	ID        string          `json:"id"`
 	Image     string          `json:"image"`
+	Platform  string          `json:"platform"`
 	Filter    string          `json:"filter"`
 	Spec      json.RawMessage `json:"spec"`
 	Cmd       []string        `json:"cmd"`
