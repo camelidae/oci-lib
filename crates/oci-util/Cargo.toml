@@ -38,7 +38,7 @@ p521 = { version = "0.14.0", features = ["ecdsa", "pkcs8"] }
 rsa = { version = "0.9.10", features = ["getrandom", "sha2"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
-sha2 = { version = "0.10", features = ["oid"] }
+sha2 = { version = "0.11", features = ["oid"] }
 x509-parser = "0.18.1"
 flate2 = { version = "1", optional = true }
 zstd = { version = "0.14", optional = true }
@@ -89,5 +89,5 @@ objc2-virtualization = { optional = true, version = "0.3.2", default-features = 
 ] }
 
 [dev-dependencies]
-rcgen = "0.13"
+rcgen = "0.14"
 time = "0.3"
