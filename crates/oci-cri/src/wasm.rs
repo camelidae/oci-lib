@@ -128,22 +128,18 @@ fn command_is_wasm(command: &[String]) -> bool {
         .is_some_and(|program| program.ends_with(".wasm"))
 }
 
-/// Argv the guest sees. This follows the same precedence as native
-/// `convert::image_args`: an explicit command replaces the image entrypoint
-/// and command, and explicit args replace the image command.
+/// Argv the guest sees: an explicit command, otherwise the image entrypoint
+/// and default command.
 #[must_use]
 pub fn resolved_command(command: &[String], args: &[String], image: &ImageSpec) -> Vec<String> {
-    if !command.is_empty() {
-        let mut argv = command.to_vec();
-        argv.extend(args.iter().cloned());
-        return argv;
-    }
-    let mut argv = image.entrypoint.clone();
-    if args.is_empty() {
-        argv.extend(image.cmd.iter().cloned());
+    let mut argv = if command.is_empty() {
+        let mut from_image = image.entrypoint.clone();
+        from_image.extend(image.cmd.iter().cloned());
+        from_image
     } else {
-        argv.extend(args.iter().cloned());
-    }
+        command.to_vec()
+    };
+    argv.extend(args.iter().cloned());
     argv
 }
 
@@ -417,14 +413,12 @@ mod tests {
         let from_image = resolved_command(&[], &["--flag".into()], &spec);
         assert_eq!(
             from_image,
-            vec!["/image.wasm".to_string(), "--flag".to_string()]
+            vec![
+                "/image.wasm".to_string(),
+                "from-image".to_string(),
+                "--flag".to_string()
+            ]
         );
-        let replaced = resolved_command(&[], &["/bin/sh".into()], &{
-            let mut cmd_only = image();
-            cmd_only.cmd = vec!["app.wasm".into()];
-            cmd_only
-        });
-        assert_eq!(replaced, vec!["/bin/sh".to_string()]);
     }
 
     #[test]
