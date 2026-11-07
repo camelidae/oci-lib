@@ -3,7 +3,7 @@ resolver = "2"
 members = ["crates/oci-builder", "crates/oci-runner", "crates/oci-util", "crates/oci-cri", "xtask", "crates/oci-wasip3"]
 
 [workspace.package]
-version = "0.1.14"
+version = "0.1.15"
 edition = "2024"
 license = "Apache-2.0"
 rust-version = "1.85"
