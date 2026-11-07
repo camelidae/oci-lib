@@ -73,9 +73,6 @@ pub struct SandboxRecord {
     /// Directory kubelet expects container logs under.
     #[serde(default)]
     pub log_directory: String,
-    /// CRI runtime handler (`""` is the native default, `zwasm` is WASI).
-    #[serde(default)]
-    pub runtime_handler: String,
 }
 
 /// Container lifecycle state.
@@ -154,16 +151,6 @@ pub struct ContainerRecord {
     /// Stop signal name from the image/container config.
     #[serde(default)]
     pub stop_signal: String,
-    /// `wasm` when the container runs under zWasm. Empty and any other value
-    /// stay on libcontainer, including records written before this field.
-    #[serde(default)]
-    pub executor: String,
-    /// Guest process id once a WASM container has started. `0` otherwise.
-    #[serde(default)]
-    pub host_pid: i32,
-    /// JSON wasm guest spec for a WASM container. Empty for native containers.
-    #[serde(default)]
-    pub wasm_spec: String,
 }
 
 fn minus_one() -> i32 {
@@ -417,7 +404,6 @@ mod tests {
             host_network: false,
             linux_json: String::new(),
             log_directory: String::new(),
-            runtime_handler: String::new(),
         }
     }
 
@@ -472,27 +458,7 @@ mod tests {
             config_bytes: Vec::new(),
             rootfs: String::new(),
             stop_signal: String::new(),
-            executor: String::new(),
-            host_pid: 0,
-            wasm_spec: String::new(),
         }
-    }
-
-    #[test]
-    fn a_record_written_before_executor_stays_native() {
-        let raw = r#"{
-            "id":"c","sandbox_id":"s",
-            "metadata":{"name":"app","uid":"","namespace":"","attempt":0},
-            "image":"app","state":"Created","created_at_ns":1,"exit_code":-1
-        }"#;
-        let record: ContainerRecord = serde_json::from_str(raw).unwrap();
-        assert!(record.executor.is_empty());
-        assert!(!crate::wasm::is_wasm_executor(&record.executor));
-        let sandbox: SandboxRecord = serde_json::from_str(
-            r#"{"id":"s","metadata":{"name":"","uid":"","namespace":"","attempt":0},"created_at_ns":1,"state":"Ready","infra_container_id":"i"}"#,
-        )
-        .unwrap();
-        assert!(sandbox.runtime_handler.is_empty());
     }
 
     #[test]
