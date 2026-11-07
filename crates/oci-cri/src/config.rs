@@ -13,6 +13,10 @@ pub const API_VERSION: &str = "v1";
 /// Everything the daemon needs, from CLI flags or a config file.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Config {
+    /// Directory of runtime TOML drop-ins. Missing directories are allowed.
+    pub runtime_config_dir: Option<PathBuf>,
+    /// Explicit handlers; the empty handler always retains native execution.
+    pub runtimes: std::collections::BTreeMap<String, crate::runtime_plugin::RuntimePlugin>,
     /// Name kubelet sees in `Version` and `Status` replies.
     pub runtime_name: String,
     /// Unix socket the CRI gRPC server listens on.
@@ -45,6 +49,8 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
+            runtime_config_dir: Some(PathBuf::from("/etc/oci-cri/config.d")),
+            runtimes: Default::default(),
             runtime_name: RUNTIME_NAME.to_string(),
             socket: PathBuf::from("/run/oci-cri/oci-cri.sock"),
             root: PathBuf::from("/var/lib/oci-cri"),

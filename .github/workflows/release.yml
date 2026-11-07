@@ -57,7 +57,7 @@ jobs:
         run: |
           set -euo pipefail
           sudo apt-get update
-          sudo apt-get install -y gcc pkg-config libseccomp-dev
+          sudo apt-get install -y gcc pkg-config libseccomp-dev musl-tools binutils
           if [ "${{ matrix.guest }}" = "true" ]; then
             sudo apt-get install -y musl-tools musl-dev linux-libc-dev make bzip2 cpio curl ca-certificates
             arch=$(uname -m)
@@ -75,6 +75,7 @@ jobs:
           cargo build --release --locked -p oci-builder
           cargo build --release --locked -p oci-runner
           cargo build --release --locked -p oci-cri
+          sh scripts/build-wasip3.sh
       - name: Allow unprivileged user namespaces
         run: |
           set -euo pipefail
@@ -88,6 +89,8 @@ jobs:
           cp target/release/oci-builder dist/oci-builder
           cp target/release/oci-runner dist/oci-runner
           cp target/release/oci-cri dist/oci-cri
+          cp target/release/oci-wasip3 dist/oci-wasip3
+          cp crates/oci-cri/config.d/wasmtime.toml dist/wasmtime.toml
           chmod 755 dist/oci-builder dist/oci-runner dist/oci-cri
           ./dist/oci-builder --help >/dev/null
           ./dist/oci-runner --help >/dev/null
@@ -125,6 +128,10 @@ jobs:
               actual = hashlib.sha256((root / "initramfs").read_bytes()).hexdigest()
               if document.get("initramfs_sha256") != actual:
                   raise SystemExit(f"{package}: initramfs hash does not match attestation")
+              if package == "oci-cri":
+                  for member in ("usr/local/bin/oci-wasip3", "etc/oci-cri/config.d/wasmtime.toml"):
+                      if not any(m["path"] == member and m["size"] > 0 for m in document["members"]):
+                          raise SystemExit(f"{package}: missing WASI runtime member {member}")
               ca_path = "etc/ssl/certs/ca-certificates.crt"
               ca = next((m for m in document["members"] if m["path"] == ca_path), None)
               if ca is None or ca["size"] == 0:
@@ -250,7 +257,12 @@ jobs:
               stage=$(mktemp -d)
               cp "artifacts/${target}/${pkg}" "$stage/${pkg}"
               chmod 755 "$stage/${pkg}"
-              tar -C "$stage" -czf "packages/${pkg}-${version}-${target}.tar.gz" "${pkg}"
+              if [ "$pkg" = oci-cri ] && [[ "$target" = *linux* ]]; then
+                cp "artifacts/${target}/oci-wasip3" "artifacts/${target}/wasmtime.toml" "$stage/"
+                tar -C "$stage" -czf "packages/${pkg}-${version}-${target}.tar.gz" "$pkg" oci-wasip3 wasmtime.toml
+              else
+                tar -C "$stage" -czf "packages/${pkg}-${version}-${target}.tar.gz" "$pkg"
+              fi
               rm -rf "$stage"
             done
           done

@@ -92,14 +92,19 @@ impl ImageService for CriService {
         request: Request<ImageStatusRequest>,
     ) -> Result<Response<ImageStatusResponse>, Status> {
         let request = request.into_inner();
-        let wanted = request.image.map(|i| i.image).unwrap_or_default();
+        let spec = request.image.unwrap_or_default();
+        let plugin = crate::runtime_plugin::resolve(&self.inner.config, &spec.runtime_handler)?;
+        let wanted = spec.image;
         let found = self
             .inner
             .engine
             .list_images("")
             .map_err(Status::from)?
             .into_iter()
-            .find(|image| image.matches_reference(&wanted));
+            .find(|image| {
+                image.matches_reference(&wanted)
+                    && crate::runtime_plugin::matches_image(plugin, image)
+            });
         Ok(Response::new(ImageStatusResponse {
             image: found.as_ref().map(to_image),
             info: if request.verbose {
@@ -139,9 +144,24 @@ impl ImageService for CriService {
                 identity_token: a.identity_token,
             });
             let image = crate::image_reference::normalize(&spec.image)?;
-            inner
-                .engine
-                .pull_image(&image, auth.as_ref(), inner.config.insecure_registries)
+            let plugin = crate::runtime_plugin::resolve(&inner.config, &spec.runtime_handler)?;
+            let id = inner.engine.pull_image_for_platform(
+                &image,
+                auth.as_ref(),
+                inner.config.insecure_registries,
+                plugin.map(|p| p.platform.as_str()),
+            )?;
+            let matches = inner.engine.list_images("")?.iter().any(|image| {
+                image.matches_reference(&id) && crate::runtime_plugin::matches_image(plugin, image)
+            });
+            if !matches {
+                return Err(crate::Error::new(
+                    crate::ErrorCode::InvalidArgument,
+                    "pulled image platform does not match runtime handler",
+                    &spec.runtime_handler,
+                ));
+            }
+            Ok(id)
         })
         .await
         .map_err(|e| Status::internal(e.to_string()))??;

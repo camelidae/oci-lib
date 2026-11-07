@@ -47,6 +47,14 @@ impl FakeEngine {
         }
     }
 
+    /// Install explicit image metadata for runtime/platform tests.
+    pub fn insert_image(&self, image: EngineImage) {
+        self.images
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(image.id.clone(), image);
+    }
+
     fn container(&self, id: &str) -> Result<Arc<Mutex<FakeContainer>>> {
         self.containers
             .lock()
