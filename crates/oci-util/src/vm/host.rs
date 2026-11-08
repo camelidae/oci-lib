@@ -389,6 +389,10 @@ where
     }
 }
 
+fn select_vm_cpu_count(host_count: Option<usize>, min: usize, max: usize) -> usize {
+    host_count.unwrap_or(2).clamp(min, max)
+}
+
 fn vm_config(
     guest: &GuestConfig,
     kernel: &Path,
@@ -409,7 +413,13 @@ fn vm_config(
     let cpu = {
         let min = unsafe { VZVirtualMachineConfiguration::minimumAllowedCPUCount() };
         let max = unsafe { VZVirtualMachineConfiguration::maximumAllowedCPUCount() };
-        2.clamp(min, max)
+        select_vm_cpu_count(
+            thread::available_parallelism()
+                .ok()
+                .map(|count| count.get()),
+            min,
+            max,
+        )
     };
     let memory = {
         let min = unsafe { VZVirtualMachineConfiguration::minimumAllowedMemorySize() };
@@ -454,7 +464,7 @@ fn vm_config(
         let device = unsafe {
             VZVirtioFileSystemDeviceConfiguration::initWithTag(
                 VZVirtioFileSystemDeviceConfiguration::alloc(),
-                &NSString::from_str(export.tag),
+                &NSString::from_str(&export.tag),
             )
         };
         unsafe { device.setShare(Some(&share)) };
@@ -568,4 +578,16 @@ fn ns_error_text(err: &NSError) -> String {
 
 fn io_err(err: io::Error) -> VmError {
     VmError::new(VmErrorKind::Internal, format!("guest socket: {err}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::select_vm_cpu_count;
+
+    #[test]
+    fn vm_cpu_count_tracks_host_parallelism_with_framework_bounds() {
+        assert_eq!(select_vm_cpu_count(Some(16), 1, 16), 16);
+        assert_eq!(select_vm_cpu_count(Some(16), 1, 8), 8);
+        assert_eq!(select_vm_cpu_count(None, 1, 8), 2);
+    }
 }

@@ -8,6 +8,7 @@
 //! namespace is the infra container's (`/proc/<pid>/ns/net` once running).
 
 use std::io::Write;
+use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
@@ -29,6 +30,81 @@ pub struct CniResult {
 /// Whether CNI is configured (a conf dir with at least one config file).
 pub fn configured(config: &Config) -> bool {
     config.cni_conf_dir.is_some()
+}
+
+/// IPv4 network reserved for pod interfaces inside the macOS CRI guest.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GuestPodNetwork {
+    /// Network address of the selected quarter of the guest uplink subnet.
+    pub subnet: Ipv4Addr,
+    /// Prefix length of the pod subnet.
+    pub prefix: u8,
+    /// Bridge gateway assigned to the first usable address.
+    pub gateway: Ipv4Addr,
+    /// First address host-local may assign to a pod.
+    pub range_start: Ipv4Addr,
+    /// Last address host-local may assign to a pod.
+    pub range_end: Ipv4Addr,
+}
+
+/// Choose the highest quarter-subnet that does not contain the guest's own
+/// uplink address. The quartering leaves the other three quarters available
+/// to the host's NAT/DHCP network.
+pub fn guest_pod_network(guest_ip: Ipv4Addr, guest_prefix: u8) -> Option<GuestPodNetwork> {
+    if guest_prefix > 28 {
+        return None;
+    }
+
+    let host_bits = 32 - guest_prefix;
+    let quarter_bits = host_bits - 2;
+    let quarter_size = 1_u32 << quarter_bits;
+    let address = u32::from(guest_ip);
+    let network = if guest_prefix == 0 {
+        0
+    } else {
+        address & (u32::MAX << host_bits)
+    };
+    let guest_quarter = (address - network) / quarter_size;
+    let quarter = (0..4).rev().find(|quarter| *quarter != guest_quarter)?;
+    let subnet = network + quarter * quarter_size;
+    let broadcast = subnet + quarter_size - 1;
+
+    Some(GuestPodNetwork {
+        subnet: Ipv4Addr::from(subnet),
+        prefix: guest_prefix + 2,
+        gateway: Ipv4Addr::from(subnet + 1),
+        range_start: Ipv4Addr::from(subnet + 2),
+        range_end: Ipv4Addr::from(broadcast - 1),
+    })
+}
+
+/// Build the CNI bridge configuration for a pod subnet on the guest uplink.
+pub fn guest_conflist(network: GuestPodNetwork, mtu: u32) -> Value {
+    let subnet = format!("{}/{}", network.subnet, network.prefix);
+    serde_json::json!({
+        "cniVersion": "1.0.0",
+        "name": "oci-cri-guest",
+        "plugins": [
+            { "type": "loopback" },
+            {
+                "type": "bridge",
+                "bridge": "cni0",
+                "isGateway": true,
+                "ipMasq": false,
+                "hairpinMode": true,
+                "mtu": mtu,
+                "ipam": {
+                    "type": "host-local",
+                    "ranges": [[{
+                        "subnet": subnet,
+                        "rangeStart": network.range_start.to_string(),
+                        "rangeEnd": network.range_end.to_string()
+                    }]],
+                    "routes": [{ "dst": "0.0.0.0/0" }]
+                }
+            }
+        ]
+    })
 }
 
 /// Load the merged CNI configuration (first `.conflist`, else first `.conf`)
@@ -291,6 +367,57 @@ fn protocol_name(protocol: i32) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn selects_highest_quarter_outside_guest_address() {
+        let network = guest_pod_network(Ipv4Addr::new(192, 168, 64, 2), 24).unwrap();
+        assert_eq!(network.subnet, Ipv4Addr::new(192, 168, 64, 192));
+        assert_eq!(network.prefix, 26);
+        assert_eq!(network.gateway, Ipv4Addr::new(192, 168, 64, 193));
+        assert_eq!(network.range_start, Ipv4Addr::new(192, 168, 64, 194));
+        assert_eq!(network.range_end, Ipv4Addr::new(192, 168, 64, 254));
+    }
+
+    #[test]
+    fn skips_highest_quarter_when_it_contains_guest_address() {
+        let network = guest_pod_network(Ipv4Addr::new(192, 168, 64, 230), 24).unwrap();
+        assert_eq!(network.subnet, Ipv4Addr::new(192, 168, 64, 128));
+        assert_eq!(network.prefix, 26);
+    }
+
+    #[test]
+    fn supports_larger_uplink_subnets() {
+        let network = guest_pod_network(Ipv4Addr::new(10, 1, 2, 3), 16).unwrap();
+        assert_eq!(network.subnet, Ipv4Addr::new(10, 1, 192, 0));
+        assert_eq!(network.prefix, 18);
+    }
+
+    #[test]
+    fn rejects_uplink_subnets_without_four_safe_quarters() {
+        assert!(guest_pod_network(Ipv4Addr::new(192, 168, 1, 2), 29).is_none());
+        assert!(guest_pod_network(Ipv4Addr::new(192, 168, 1, 2), 31).is_none());
+    }
+
+    #[test]
+    fn conflist_chains_loopback_and_bridge_with_host_local_ipam() {
+        let network = guest_pod_network(Ipv4Addr::new(192, 168, 64, 2), 24).unwrap();
+        let config = guest_conflist(network, 1280);
+        assert_eq!(config["cniVersion"], "1.0.0");
+        let plugins = config["plugins"].as_array().unwrap();
+        assert_eq!(plugins[0]["type"], "loopback");
+        assert_eq!(plugins[1]["type"], "bridge");
+        assert_eq!(plugins[1]["bridge"], "cni0");
+        assert_eq!(plugins[1]["isGateway"], true);
+        assert_eq!(plugins[1]["ipMasq"], false);
+        assert_eq!(plugins[1]["hairpinMode"], true);
+        assert_eq!(plugins[1]["mtu"], 1280);
+        assert_eq!(plugins[1]["ipam"]["type"], "host-local");
+        assert_eq!(
+            plugins[1]["ipam"]["ranges"][0][0]["subnet"],
+            "192.168.64.192/26"
+        );
+        assert_eq!(plugins[1]["ipam"]["routes"][0]["dst"], "0.0.0.0/0");
+    }
 
     #[test]
     fn parses_ips_from_a_result() {

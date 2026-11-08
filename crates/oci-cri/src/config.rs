@@ -25,6 +25,9 @@ pub struct Config {
     pub root: PathBuf,
     /// Runtime state directory passed to libcontainer.
     pub state_root: PathBuf,
+    /// Host directories exported into the macOS Linux guest at the same
+    /// absolute paths. Ignored on Linux.
+    pub host_shares: Vec<PathBuf>,
     /// Pause/infra image run as every pod sandbox.
     pub sandbox_image: String,
     /// Directory holding CNI plugin binaries. Empty disables CNI (sandboxes
@@ -55,6 +58,7 @@ impl Default for Config {
             socket: PathBuf::from("/run/oci-cri/oci-cri.sock"),
             root: PathBuf::from("/var/lib/oci-cri"),
             state_root: PathBuf::from("/run/oci-cri/state"),
+            host_shares: Vec::new(),
             sandbox_image: "registry.k8s.io/pause:3.10.1".to_string(),
             cni_bin_dir: None,
             cni_conf_dir: None,
@@ -119,6 +123,29 @@ impl Config {
                 "",
             ));
         }
+        for path in &self.host_shares {
+            let Some(text) = path.to_str() else {
+                return Err(crate::Error::new(
+                    crate::ErrorCode::InvalidArgument,
+                    "host share path must be valid UTF-8",
+                    "",
+                ));
+            };
+            if !path.is_absolute()
+                || text
+                    .chars()
+                    .any(|character| matches!(character, '\t' | '\n' | '\r'))
+            {
+                return Err(crate::Error::new(
+                    crate::ErrorCode::InvalidArgument,
+                    format!(
+                        "host share path must be absolute and contain no tabs or newlines: {}",
+                        path.display()
+                    ),
+                    "",
+                ));
+            }
+        }
         self.streaming_socket_addr()?;
         Ok(())
     }
@@ -180,6 +207,31 @@ mod tests {
             config.validate().unwrap_err().code(),
             crate::ErrorCode::InvalidArgument
         );
+    }
+
+    #[test]
+    fn host_shares_must_be_absolute_and_manifest_safe() {
+        for path in [
+            PathBuf::from("relative/path"),
+            PathBuf::from("/tmp/share\tname"),
+            PathBuf::from("/tmp/share\nname"),
+            PathBuf::from("/tmp/share\rname"),
+        ] {
+            let config = Config {
+                host_shares: vec![path],
+                ..Config::default()
+            };
+            assert_eq!(
+                config.validate().unwrap_err().code(),
+                crate::ErrorCode::InvalidArgument
+            );
+        }
+
+        let config = Config {
+            host_shares: vec![PathBuf::from("/tmp/share with spaces")],
+            ..Config::default()
+        };
+        config.validate().unwrap();
     }
 
     #[test]

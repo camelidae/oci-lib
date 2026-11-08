@@ -7,6 +7,11 @@
 //! `crates/<package>/guest/out/{vmlinuz,initramfs,attestation.json}`.
 //! Run it on Linux, on the same architecture as the Mac (arm64 for Apple
 //! Silicon). With no package it builds all product guests.
+//!
+//! Optional env for the oci-cri guest:
+//! - `ROK_RUNSC`: path to a linux/arm64 `runsc` binary embedded as `/bin/runsc`
+//! - `ROK_GUEST_KERNEL_SRC`: path to an uncompressed ARM64 kernel `Image`
+//!   used instead of the default arcboxlabs kernel download
 
 use std::collections::BTreeMap;
 use std::env;
@@ -28,6 +33,7 @@ const PACKAGES: [&str; 3] = ["oci-builder", "oci-runner", "oci-cri"];
 const KERNEL_RELEASE: &str = "https://github.com/arcboxlabs/kernel/releases/download/v0.0.25";
 const BUSYBOX: &str = "busybox-1.36.1";
 const BUSYBOX_SHA: &str = "b8cc24c9574d809e7279c3be349795c5d5ceb6fdf19ca709f80cde50e47de314";
+const CNI_PLUGINS_VERSION: &str = "v1.9.1";
 
 type Result<T> = std::result::Result<T, String>;
 
@@ -77,8 +83,9 @@ fn guest(packages: &[String]) -> Result<()> {
     // Debian/Ubuntu and Alpine install their maintained public roots here.
     // Fail before building anything if the build environment lacks them.
     let ca_bundle = ca::load(&Path::new("/").join(ca::BUNDLE_PATH))?;
-    let kernel = fetch_kernel(&cache)?;
+    let kernel = resolve_kernel(&cache)?;
     let busybox = build_busybox(&cache)?;
+    let runsc = resolve_runsc()?;
     for package in packages {
         let bin = build_package(&root, &target_dir, package)?;
         let crate_dir = root.join("crates").join(package);
@@ -102,6 +109,9 @@ fn guest(packages: &[String]) -> Result<()> {
         archive.file(package, 0o755, read(&bin)?);
         add_shared_libraries(&mut archive, &bin, package)?;
         if package == "oci-cri" {
+            for (name, path) in fetch_cni_plugins(&cache)? {
+                archive.file(&format!("opt/cni/bin/{name}"), 0o755, read(&path)?);
+            }
             run(Command::new("sh")
                 .arg(root.join("scripts/build-wasip3.sh"))
                 .current_dir(&root))?;
@@ -112,6 +122,10 @@ fn guest(packages: &[String]) -> Result<()> {
                 0o644,
                 include_bytes!("../../crates/oci-cri/config.d/wasmtime.toml").to_vec(),
             );
+            if let Some(runsc) = runsc.as_ref() {
+                archive.file("bin/runsc", 0o755, read(runsc)?);
+                eprintln!("oci-cri guest: embedding runsc from {}", runsc.display());
+            }
         }
 
         let initramfs = out.join("initramfs");
@@ -165,6 +179,32 @@ fn workspace_root() -> PathBuf {
         .parent()
         .expect("xtask sits inside the workspace")
         .to_path_buf()
+}
+
+fn resolve_kernel(cache: &Path) -> Result<PathBuf> {
+    if let Some(path) = env::var_os("ROK_GUEST_KERNEL_SRC") {
+        let path = PathBuf::from(path);
+        if !path.is_file() {
+            return Err(format!(
+                "ROK_GUEST_KERNEL_SRC is not a file: {}",
+                path.display()
+            ));
+        }
+        eprintln!("using guest kernel from {}", path.display());
+        return Ok(path);
+    }
+    fetch_kernel(cache)
+}
+
+fn resolve_runsc() -> Result<Option<PathBuf>> {
+    let Some(path) = env::var_os("ROK_RUNSC") else {
+        return Ok(None);
+    };
+    let path = PathBuf::from(path);
+    if !path.is_file() {
+        return Err(format!("ROK_RUNSC is not a file: {}", path.display()));
+    }
+    Ok(Some(path))
 }
 
 fn fetch_kernel(cache: &Path) -> Result<PathBuf> {
@@ -237,6 +277,50 @@ fn build_busybox(cache: &Path) -> Result<PathBuf> {
     run(&mut make)?;
     fs::copy(src.join("busybox"), &busybox).map_err(|err| format!("copying busybox: {err}"))?;
     Ok(busybox)
+}
+
+fn fetch_cni_plugins(cache: &Path) -> Result<Vec<(String, PathBuf)>> {
+    let (architecture, sha) = match env::consts::ARCH {
+        "aarch64" => (
+            "arm64",
+            "56171987d3947707c3563db2f4001bccaf50fd63468611b9f3cbecb1375ee7ec",
+        ),
+        "x86_64" => (
+            "amd64",
+            "b98f74a0f8522f0a83867178729c1aa70f2158f90c45a2ca8fa791db1c76b303",
+        ),
+        other => return Err(format!("CNI plugins are unavailable for {other}")),
+    };
+    let asset = format!("cni-plugins-linux-{architecture}-{CNI_PLUGINS_VERSION}.tgz");
+    let archive = cache.join(&asset);
+    fetch(
+        &format!(
+            "https://github.com/containernetworking/plugins/releases/download/{CNI_PLUGINS_VERSION}/{asset}"
+        ),
+        &archive,
+        sha,
+    )?;
+
+    let directory = cache.join(format!("cni-plugins-{architecture}-{CNI_PLUGINS_VERSION}"));
+    fs::create_dir_all(&directory)
+        .map_err(|err| format!("creating {}: {err}", directory.display()))?;
+    let names = ["bridge", "host-local", "loopback"];
+    run(Command::new("tar")
+        .arg("-xzf")
+        .arg(&archive)
+        .arg("-C")
+        .arg(&directory)
+        .args(names))?;
+    names
+        .into_iter()
+        .map(|name| {
+            let path = directory.join(name);
+            if !path.is_file() {
+                return Err(format!("CNI plugin archive omitted {name}"));
+            }
+            Ok((name.to_string(), path))
+        })
+        .collect()
 }
 
 /// musl-gcc does not search the glibc header tree, so linux/kd.h and
