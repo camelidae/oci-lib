@@ -12,12 +12,14 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"syscall"
 	"time"
 
 	specs "github.com/opencontainers/runtime-spec/specs-go"
+	"golang.org/x/sys/unix"
 )
 
 // External OCI runtime (for example runsc) selected with ROK_OCI_RUNTIME.
@@ -26,16 +28,17 @@ import (
 // env var is unset or empty.
 
 type extHandle struct {
-	bundleDir string
-	cmd       *exec.Cmd
-	stdin     io.WriteCloser
-	pumps     sync.WaitGroup
-	startMu   sync.Mutex
-	startErr  error
-	waitDone  chan struct{}
-	waitErr   error
-	exitCode  int
-	oomKilled bool
+	bundleDir  string
+	namespaces map[string]*os.File
+	cmd        *exec.Cmd
+	stdin      io.WriteCloser
+	pumps      sync.WaitGroup
+	startMu    sync.Mutex
+	startErr   error
+	waitDone   chan struct{}
+	waitErr    error
+	exitCode   int
+	oomKilled  bool
 }
 
 var (
@@ -179,12 +182,17 @@ func opStartExternal(req *opRequest, hooks *ioHooks) (retErr error) {
 	if err != nil {
 		return err
 	}
+	if err := prepareExternalNetNS(req, h, spec); err != nil {
+		return err
+	}
 	args := append(runtimeFlags(stateRootOf(req)), "run", "--bundle", h.bundleDir, req.ID)
 	cmd := exec.Command(bin, args...)
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 
 	stdinRead, stdinWrite, err := os.Pipe()
 	if err != nil {
+		closeNamespaces(h.namespaces)
+		h.namespaces = nil
 		return fail(codeInternal, "stdin pipe", err.Error())
 	}
 	defer stdinRead.Close()
@@ -194,6 +202,8 @@ func opStartExternal(req *opRequest, hooks *ioHooks) (retErr error) {
 	started := false
 	defer func() {
 		if !started {
+			closeNamespaces(h.namespaces)
+			h.namespaces = nil
 			_ = stdinWrite.Close()
 			h.stdin = nil
 			if cmd.Process != nil {
@@ -257,6 +267,110 @@ func opStartExternal(req *opRequest, hooks *ioHooks) (retErr error) {
 		close(h.waitDone)
 	}()
 	started = true
+	return nil
+}
+
+func externalCNIConfigured() bool {
+	dir := strings.TrimSpace(os.Getenv("ROK_CNI_CONF_DIR"))
+	if dir == "" {
+		dir = "/etc/cni/net.d"
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return false
+	}
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+		ext := filepath.Ext(entry.Name())
+		if ext == ".conf" || ext == ".conflist" {
+			return true
+		}
+	}
+	return false
+}
+
+func createNetNS() (*os.File, error) {
+	type result struct {
+		file *os.File
+		err  error
+	}
+	ch := make(chan result, 1)
+	go func() {
+		runtime.LockOSThread()
+		selfNet := fmt.Sprintf("/proc/%d/task/%d/ns/net", os.Getpid(), unix.Gettid())
+		orig, err := os.Open(selfNet)
+		if err != nil {
+			runtime.UnlockOSThread()
+			ch <- result{err: err}
+			return
+		}
+		if err := unix.Unshare(unix.CLONE_NEWNET); err != nil {
+			_ = orig.Close()
+			runtime.UnlockOSThread()
+			ch <- result{err: err}
+			return
+		}
+		created, openErr := os.Open(selfNet)
+		restoreErr := unix.Setns(int(orig.Fd()), unix.CLONE_NEWNET)
+		_ = orig.Close()
+		if restoreErr != nil {
+			if created != nil {
+				_ = created.Close()
+			}
+			// Keep the OS thread locked so the runtime terminates it on exit.
+			ch <- result{err: restoreErr}
+			return
+		}
+		runtime.UnlockOSThread()
+		ch <- result{file: created, err: openErr}
+	}()
+	res := <-ch
+	return res.file, res.err
+}
+
+// When a sandbox requests a fresh network namespace (Path == ""), allocate and
+// pin one in the daemon so CNI and subsequent container joins can address it
+// via /proc/<self>/fd/<fd> while runsc runs with --network=host inside it.
+// When CNI is disabled, drop the unconfigured empty network namespace request
+// so sandboxes continue sharing the guest network namespace.
+func prepareExternalNetNS(req *opRequest, h *extHandle, spec *specs.Spec) error {
+	if spec.Linux == nil {
+		return nil
+	}
+	idx := -1
+	for i, ns := range spec.Linux.Namespaces {
+		if ns.Type == specs.NetworkNamespace {
+			idx = i
+			break
+		}
+	}
+	if idx < 0 || spec.Linux.Namespaces[idx].Path != "" {
+		return nil
+	}
+	if externalCNIConfigured() {
+		netFile, err := createNetNS()
+		if err != nil {
+			return fail(codeRun, "create sandbox netns", err.Error())
+		}
+		h.namespaces = map[string]*os.File{"net": netFile}
+		spec.Linux.Namespaces[idx].Path = namespacePaths(h.namespaces)["net"]
+	} else {
+		spec.Linux.Namespaces = append(spec.Linux.Namespaces[:idx], spec.Linux.Namespaces[idx+1:]...)
+	}
+	specJSON, err := json.Marshal(spec)
+	if err != nil {
+		closeNamespaces(h.namespaces)
+		h.namespaces = nil
+		return fail(codeInternal, "encoding spec", err.Error())
+	}
+	if err := os.WriteFile(filepath.Join(h.bundleDir, "config.json"), specJSON, 0o600); err != nil {
+		closeNamespaces(h.namespaces)
+		h.namespaces = nil
+		return fail(codeInternal, "writing bundle config", err.Error())
+	}
+	_ = os.WriteFile(filepath.Join(specDir(req.StoreRoot), req.ID+".json"), specJSON, 0o600)
 	return nil
 }
 
@@ -336,6 +450,8 @@ func opDeleteExternal(req *opRequest) error {
 		if h.stdin != nil {
 			_ = h.stdin.Close()
 		}
+		closeNamespaces(h.namespaces)
+		h.namespaces = nil
 		h.startMu.Unlock()
 	}
 	if bin, err := externalRuntimeBinary(); err == nil {
@@ -369,7 +485,7 @@ func opStateExternal(req *opRequest) (any, error) {
 				if h.cmd != nil && h.cmd.Process != nil {
 					pid = h.cmd.Process.Pid
 				}
-				return map[string]any{"status": "running", "pid": pid, "exit_code": -1}, nil
+				return map[string]any{"status": "running", "pid": pid, "exit_code": -1, "namespaces": namespacePaths(h.namespaces)}, nil
 			}
 		}
 		h.startMu.Unlock()

@@ -5,22 +5,53 @@
 //! Listens on [`crate::proto::VSOCK_PORT`], writes [`GUEST_BANNER`] on each
 //! accept, then proxies bytes to the in-guest CRI unix socket.
 
+#[cfg(target_os = "linux")]
 use std::ffi::CStr;
+#[cfg(target_os = "linux")]
 use std::fs::File;
-use std::io::{self, Write};
+use std::io;
+#[cfg(target_os = "linux")]
+use std::io::Write;
 use std::net::Ipv4Addr;
+#[cfg(target_os = "linux")]
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+#[cfg(target_os = "linux")]
 use std::path::{Path, PathBuf};
+#[cfg(target_os = "linux")]
 use std::sync::Arc;
+#[cfg(target_os = "linux")]
 use std::thread;
 
+#[cfg(target_os = "linux")]
 use crate::config::Config;
+#[cfg(target_os = "linux")]
 use crate::engine::Engine;
+#[cfg(target_os = "linux")]
 use crate::error::{Error, ErrorCode};
+#[cfg(target_os = "linux")]
 use crate::proto::{GUEST_BANNER, VSOCK_PORT};
+#[cfg(target_os = "linux")]
 use crate::server;
 
+const NLMSG_ERROR: u16 = 2;
+const RTM_NEWLINK: u16 = 16;
+const RTM_DELLINK: u16 = 17;
+const NLM_F_REQUEST: u16 = 0x0001;
+const NLM_F_ACK: u16 = 0x0004;
+const NLM_F_EXCL: u16 = 0x0200;
+const NLM_F_CREATE: u16 = 0x0400;
+
+const IFLA_IFNAME: u16 = 3;
+const IFLA_LINKINFO: u16 = 18;
+const IFLA_INFO_KIND: u16 = 1;
+const IFLA_INFO_DATA: u16 = 2;
+const VETH_INFO_PEER: u16 = 1;
+
+const NLMSG_HDRLEN: usize = 16;
+const IFINFOMSG_LEN: usize = 16;
+
 /// Guest-side agent entry point (`oci-cri --engine-serve`).
+#[cfg(target_os = "linux")]
 pub fn engine_serve() -> Result<i32, Error> {
     // Host exports Config::root as virtiofs tag `root` and Config::state_root
     // as tag `runroot`. Init mounts those at /mnt/root and /mnt/runroot (with
@@ -83,6 +114,7 @@ pub fn engine_serve() -> Result<i32, Error> {
     result
 }
 
+#[cfg(target_os = "linux")]
 fn configure_guest_network(config: &mut Config) -> Result<(), Error> {
     let Some((interface, address, prefix)) = guest_uplink() else {
         eprintln!("oci-cri: no guest NAT IPv4 uplink found; CNI remains disabled");
@@ -91,15 +123,15 @@ fn configure_guest_network(config: &mut Config) -> Result<(), Error> {
     // Streaming URLs still need the NAT-facing address even when CNI is off.
     config.streaming_address = address.to_string();
 
-    // diorama-vm kernels defer VETH/BRIDGE; without them the bridge CNI plugin
-    // hangs RunPodSandbox. Skip CNI until the guest has veth, or when asked.
+    // Built-in CONFIG_VETH=y does not expose /sys/module/veth, so functionally
+    // probe creating and deleting a veth pair and bridge via rtnetlink.
     if std::env::var_os("ROK_DISABLE_GUEST_CNI").is_some() {
         eprintln!("oci-cri: guest CNI disabled by ROK_DISABLE_GUEST_CNI; streaming on {address}");
         return Ok(());
     }
-    if !Path::new("/sys/module/veth").is_dir() {
+    if let Err(reason) = probe_guest_cni() {
         eprintln!(
-            "oci-cri: kernel has no veth module; CNI disabled (sandboxes share guest netns); streaming on {address}"
+            "oci-cri: guest CNI probe failed ({reason}); CNI disabled (sandboxes share guest netns); streaming on {address}"
         );
         return Ok(());
     }
@@ -134,6 +166,160 @@ fn configure_guest_network(config: &mut Config) -> Result<(), Error> {
     Ok(())
 }
 
+/// Functionally verify that the running kernel can create and delete both a
+/// `veth` pair and a `bridge` interface via `AF_NETLINK` (`NETLINK_ROUTE`).
+#[cfg(target_os = "linux")]
+fn probe_guest_cni() -> Result<(), String> {
+    let fd = unsafe {
+        libc::socket(
+            libc::AF_NETLINK,
+            libc::SOCK_RAW | libc::SOCK_CLOEXEC,
+            libc::NETLINK_ROUTE,
+        )
+    };
+    if fd < 0 {
+        return Err(format!("rtnetlink socket: {}", io::Error::last_os_error()));
+    }
+    let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+
+    let mut seq = 1_u32;
+    for (kind, name, peer) in [
+        ("veth", "rok-cni-veth0", Some("rok-cni-veth1")),
+        ("bridge", "rok-cni-br0", None),
+    ] {
+        // Best-effort cleanup in case a previous probe left the interface behind.
+        let _ = rtnetlink_exchange(&fd, &rtnetlink_dellink_message(seq, name));
+        seq += 1;
+
+        let create = rtnetlink_newlink_message(seq, name, kind, peer);
+        seq += 1;
+        if let Err(err) = rtnetlink_exchange(&fd, &create) {
+            return Err(format!("{kind} create: {err}"));
+        }
+
+        let delete = rtnetlink_dellink_message(seq, name);
+        seq += 1;
+        if let Err(err) = rtnetlink_exchange(&fd, &delete) {
+            return Err(format!("{kind} delete: {err}"));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn rtnetlink_exchange(fd: &OwnedFd, request: &[u8]) -> io::Result<()> {
+    let sent = unsafe {
+        libc::send(
+            fd.as_raw_fd(),
+            request.as_ptr().cast::<libc::c_void>(),
+            request.len(),
+            0,
+        )
+    };
+    if sent < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let mut reply = [0_u8; 512];
+    let received = unsafe {
+        libc::recv(
+            fd.as_raw_fd(),
+            reply.as_mut_ptr().cast::<libc::c_void>(),
+            reply.len(),
+            0,
+        )
+    };
+    if received < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    parse_rtnetlink_ack(&reply[..received as usize])
+}
+
+fn push_nla(buf: &mut Vec<u8>, attr_type: u16, payload: &[u8]) {
+    let len = (4 + payload.len()) as u16;
+    buf.extend_from_slice(&len.to_ne_bytes());
+    buf.extend_from_slice(&attr_type.to_ne_bytes());
+    buf.extend_from_slice(payload);
+    let pad = (4 - (buf.len() % 4)) % 4;
+    buf.resize(buf.len() + pad, 0);
+}
+
+fn cstr_bytes(value: &str) -> Vec<u8> {
+    let mut out = Vec::with_capacity(value.len() + 1);
+    out.extend_from_slice(value.as_bytes());
+    out.push(0);
+    out
+}
+
+fn build_nlmsg(msg_type: u16, flags: u16, seq: u32, attrs: &[u8]) -> Vec<u8> {
+    let total_len = (NLMSG_HDRLEN + IFINFOMSG_LEN + attrs.len()) as u32;
+    let mut msg = Vec::with_capacity(total_len as usize);
+    msg.extend_from_slice(&total_len.to_ne_bytes());
+    msg.extend_from_slice(&msg_type.to_ne_bytes());
+    msg.extend_from_slice(&flags.to_ne_bytes());
+    msg.extend_from_slice(&seq.to_ne_bytes());
+    msg.extend_from_slice(&0_u32.to_ne_bytes());
+    msg.resize(NLMSG_HDRLEN + IFINFOMSG_LEN, 0);
+    msg.extend_from_slice(attrs);
+    msg
+}
+
+fn rtnetlink_newlink_message(seq: u32, name: &str, kind: &str, peer: Option<&str>) -> Vec<u8> {
+    let mut linkinfo = Vec::new();
+    push_nla(&mut linkinfo, IFLA_INFO_KIND, &cstr_bytes(kind));
+    if let Some(peer_name) = peer {
+        let mut peer_info = vec![0_u8; IFINFOMSG_LEN];
+        push_nla(&mut peer_info, IFLA_IFNAME, &cstr_bytes(peer_name));
+        let mut info_data = Vec::new();
+        push_nla(&mut info_data, VETH_INFO_PEER, &peer_info);
+        push_nla(&mut linkinfo, IFLA_INFO_DATA, &info_data);
+    }
+    let mut attrs = Vec::new();
+    push_nla(&mut attrs, IFLA_IFNAME, &cstr_bytes(name));
+    push_nla(&mut attrs, IFLA_LINKINFO, &linkinfo);
+    build_nlmsg(
+        RTM_NEWLINK,
+        NLM_F_REQUEST | NLM_F_ACK | NLM_F_EXCL | NLM_F_CREATE,
+        seq,
+        &attrs,
+    )
+}
+
+fn rtnetlink_dellink_message(seq: u32, name: &str) -> Vec<u8> {
+    let mut attrs = Vec::new();
+    push_nla(&mut attrs, IFLA_IFNAME, &cstr_bytes(name));
+    build_nlmsg(RTM_DELLINK, NLM_F_REQUEST | NLM_F_ACK, seq, &attrs)
+}
+
+fn parse_rtnetlink_ack(buf: &[u8]) -> io::Result<()> {
+    if buf.len() < NLMSG_HDRLEN + 4 {
+        return Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "truncated rtnetlink ack",
+        ));
+    }
+    let msg_len = u32::from_ne_bytes(buf[0..4].try_into().unwrap()) as usize;
+    if msg_len < NLMSG_HDRLEN + 4 || buf.len() < msg_len {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid rtnetlink message length",
+        ));
+    }
+    let msg_type = u16::from_ne_bytes(buf[4..6].try_into().unwrap());
+    if msg_type != NLMSG_ERROR {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("unexpected rtnetlink message type {msg_type}"),
+        ));
+    }
+    let error = i32::from_ne_bytes(buf[16..20].try_into().unwrap());
+    if error == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::from_raw_os_error(-error))
+    }
+}
+
+#[cfg(target_os = "linux")]
 fn guest_uplink() -> Option<(String, Ipv4Addr, u8)> {
     let mut head = std::ptr::null_mut();
     if unsafe { libc::getifaddrs(&mut head) } != 0 {
@@ -188,6 +374,7 @@ fn ipv4_prefix(netmask: Ipv4Addr) -> Option<u8> {
     (mask == expected).then_some(prefix as u8)
 }
 
+#[cfg(target_os = "linux")]
 fn accept_loop(listener: OwnedFd, socket: &PathBuf) -> Result<i32, Error> {
     loop {
         let mut vsock = vsock_accept(&listener)
@@ -217,6 +404,7 @@ fn accept_loop(listener: OwnedFd, socket: &PathBuf) -> Result<i32, Error> {
     }
 }
 
+#[cfg(target_os = "linux")]
 fn wait_for_socket(socket: &Path) -> Result<(), Error> {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
     while std::time::Instant::now() < deadline {
@@ -232,6 +420,7 @@ fn wait_for_socket(socket: &Path) -> Result<(), Error> {
     ))
 }
 
+#[cfg(target_os = "linux")]
 fn vsock_listen(port: u32) -> io::Result<OwnedFd> {
     let fd = unsafe { libc::socket(libc::AF_VSOCK, libc::SOCK_STREAM, 0) };
     if fd < 0 {
@@ -261,6 +450,7 @@ fn vsock_listen(port: u32) -> io::Result<OwnedFd> {
     Ok(fd)
 }
 
+#[cfg(target_os = "linux")]
 fn vsock_accept(listener: &OwnedFd) -> io::Result<File> {
     let mut addr = unsafe { std::mem::zeroed::<libc::sockaddr_vm>() };
     let mut len = std::mem::size_of::<libc::sockaddr_vm>() as libc::socklen_t;
@@ -277,6 +467,95 @@ fn vsock_accept(listener: &OwnedFd) -> io::Result<File> {
     Ok(unsafe { File::from(OwnedFd::from_raw_fd(fd)) })
 }
 
+#[cfg(target_os = "linux")]
 fn io_err(err: io::Error) -> Error {
     Error::new(ErrorCode::Internal, err.to_string(), "")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ack_packet(error: i32) -> Vec<u8> {
+        let len = (NLMSG_HDRLEN + 20) as u32;
+        let mut buf = Vec::with_capacity(len as usize);
+        buf.extend_from_slice(&len.to_ne_bytes());
+        buf.extend_from_slice(&NLMSG_ERROR.to_ne_bytes());
+        buf.extend_from_slice(&0_u16.to_ne_bytes());
+        buf.extend_from_slice(&1_u32.to_ne_bytes());
+        buf.extend_from_slice(&0_u32.to_ne_bytes());
+        buf.extend_from_slice(&error.to_ne_bytes());
+        buf.resize(len as usize, 0);
+        buf
+    }
+
+    #[test]
+    fn builds_aligned_veth_and_bridge_rtnetlink_requests() {
+        let veth = rtnetlink_newlink_message(7, "rok-cni-veth0", "veth", Some("rok-cni-veth1"));
+        assert_eq!(veth.len() % 4, 0);
+        assert_eq!(
+            u32::from_ne_bytes(veth[0..4].try_into().unwrap()) as usize,
+            veth.len()
+        );
+        assert_eq!(
+            u16::from_ne_bytes(veth[4..6].try_into().unwrap()),
+            RTM_NEWLINK
+        );
+        assert_eq!(
+            u16::from_ne_bytes(veth[6..8].try_into().unwrap()),
+            NLM_F_REQUEST | NLM_F_ACK | NLM_F_EXCL | NLM_F_CREATE
+        );
+        assert_eq!(u32::from_ne_bytes(veth[8..12].try_into().unwrap()), 7);
+        assert!(veth.windows(14).any(|w| w == b"rok-cni-veth0\0"));
+        assert!(veth.windows(14).any(|w| w == b"rok-cni-veth1\0"));
+        assert!(veth.windows(5).any(|w| w == b"veth\0"));
+
+        let bridge = rtnetlink_newlink_message(8, "rok-cni-br0", "bridge", None);
+        assert_eq!(bridge.len() % 4, 0);
+        assert!(bridge.windows(12).any(|w| w == b"rok-cni-br0\0"));
+        assert!(bridge.windows(7).any(|w| w == b"bridge\0"));
+        assert!(bridge.len() < veth.len());
+
+        let del = rtnetlink_dellink_message(9, "rok-cni-br0");
+        assert_eq!(del.len() % 4, 0);
+        assert_eq!(
+            u16::from_ne_bytes(del[4..6].try_into().unwrap()),
+            RTM_DELLINK
+        );
+        assert_eq!(
+            u16::from_ne_bytes(del[6..8].try_into().unwrap()),
+            NLM_F_REQUEST | NLM_F_ACK
+        );
+    }
+
+    #[test]
+    fn parses_rtnetlink_ack_success_and_errno() {
+        parse_rtnetlink_ack(&ack_packet(0)).expect("zero error is an ACK");
+
+        let err = parse_rtnetlink_ack(&ack_packet(-libc::EOPNOTSUPP)).unwrap_err();
+        assert_eq!(err.raw_os_error(), Some(libc::EOPNOTSUPP));
+
+        let truncated = parse_rtnetlink_ack(&[0_u8; 8]).unwrap_err();
+        assert_eq!(truncated.kind(), io::ErrorKind::UnexpectedEof);
+    }
+
+    #[test]
+    fn validates_contiguous_ipv4_netmasks() {
+        assert_eq!(ipv4_prefix(Ipv4Addr::new(255, 255, 255, 0)), Some(24));
+        assert_eq!(ipv4_prefix(Ipv4Addr::new(255, 255, 0, 0)), Some(16));
+        assert_eq!(ipv4_prefix(Ipv4Addr::new(0, 0, 0, 0)), Some(0));
+        assert_eq!(ipv4_prefix(Ipv4Addr::new(255, 255, 255, 1)), None);
+    }
+
+    /// Run with `cargo test -p oci-cri serve::tests::live_probe_creates_and_deletes_veth_and_bridge -- --ignored`
+    /// inside a Linux environment with `CAP_NET_ADMIN` and `CONFIG_VETH` + `CONFIG_BRIDGE`.
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "requires Linux CAP_NET_ADMIN and kernel veth+bridge support"]
+    fn live_probe_creates_and_deletes_veth_and_bridge() {
+        probe_guest_cni().expect("veth+bridge rtnetlink probe should succeed");
+        assert!(!Path::new("/sys/class/net/rok-cni-veth0").exists());
+        assert!(!Path::new("/sys/class/net/rok-cni-veth1").exists());
+        assert!(!Path::new("/sys/class/net/rok-cni-br0").exists());
+    }
 }
