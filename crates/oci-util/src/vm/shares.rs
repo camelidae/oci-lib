@@ -40,11 +40,11 @@ pub const GUEST_AUTH: &str = "/mnt/auth";
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Export {
     /// Virtiofs tag.
-    pub tag: &'static str,
+    pub tag: String,
     /// Canonical host directory.
     pub host: PathBuf,
     /// Absolute guest mount point.
-    pub guest: &'static str,
+    pub guest: String,
     /// Whether the guest sees the share read-only.
     pub read_only: bool,
 }
@@ -116,9 +116,9 @@ pub fn export_rootfs(rootfs: &Path) -> Result<Export, String> {
         return Err(format!("{} is not a directory", host.display()));
     }
     Ok(Export {
-        tag: TAG_ROOTFS,
+        tag: TAG_ROOTFS.to_string(),
         host,
-        guest: GUEST_ROOTFS,
+        guest: GUEST_ROOTFS.to_string(),
         read_only: false,
     })
 }
@@ -139,7 +139,7 @@ pub fn guest_path(path: &Path, exports: &[Export]) -> Result<String, String> {
     let relative = path
         .strip_prefix(&export.host)
         .map_err(|err| err.to_string())?;
-    let mut guest = export.guest.to_string();
+    let mut guest = export.guest.clone();
     for component in relative.components() {
         let text = component.as_os_str().to_string_lossy();
         if text.is_empty() || text == "." {
@@ -169,9 +169,9 @@ pub fn add_dir(
         return Ok(());
     }
     exports.push(Export {
-        tag,
+        tag: tag.to_string(),
         host,
-        guest,
+        guest: guest.to_string(),
         read_only,
     });
     Ok(())

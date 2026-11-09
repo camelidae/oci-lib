@@ -4,8 +4,8 @@
 //!
 //! Each accepted host unix connection becomes one vsock dial to the guest
 //! agent. The guest writes [`GUEST_BANNER`] then forwards bytes to its local
-//! CRI gRPC server. Streaming (Exec/Attach) URLs that point at guest
-//! localhost are not rewritten yet — use CNI-disabled sandboxes for the MVP.
+//! CRI gRPC server. The guest binds its streaming server on the NAT-facing
+//! address, so URLs are directly reachable from the Mac.
 
 use std::fs::File;
 use std::io::{self, Read};
@@ -93,7 +93,7 @@ pub fn diagnose(_config: &Config) -> Result<String, Error> {
     }
     lines.extend(lines_from_attestation(EMBEDDED_ATTESTATION));
     lines.push(
-        "[note] Exec/Attach streaming URLs are not host-rewritten yet; CNI is disabled in the guest"
+        "[note] guest CNI uses a quarter of its NAT IPv4 subnet; ClusterIP services still require kube-proxy"
             .into(),
     );
     let status = if blocked { "blocked" } else { "ready" };
@@ -329,6 +329,62 @@ fn plan_exports(config: &Config) -> Result<Vec<Export>, Error> {
         false,
     )
     .map_err(|err| fail(ErrorCode::InvalidArgument, err))?;
+
+    let mut manifest = String::new();
+    for (index, guest_path) in config.host_shares.iter().enumerate() {
+        std::fs::create_dir_all(guest_path).map_err(io_err)?;
+        let host = guest_path.canonicalize().map_err(io_err)?;
+        if !host.is_dir() {
+            return Err(fail(
+                ErrorCode::InvalidArgument,
+                format!("{} is not a directory", guest_path.display()),
+            ));
+        }
+        let guest = guest_path
+            .to_str()
+            .ok_or_else(|| fail(ErrorCode::InvalidArgument, "host share path is not UTF-8"))?;
+        let canonical = host
+            .to_str()
+            .ok_or_else(|| {
+                fail(
+                    ErrorCode::InvalidArgument,
+                    "canonical host share path is not UTF-8",
+                )
+            })?
+            .to_string();
+        let tag = format!("host{index}");
+        exports.push(Export {
+            tag: tag.clone(),
+            host,
+            guest: guest.to_string(),
+            read_only: false,
+        });
+        manifest.push_str("virtiofs\t");
+        manifest.push_str(&tag);
+        manifest.push('\t');
+        manifest.push_str(guest);
+        manifest.push('\n');
+        if guest != canonical.as_str() {
+            manifest.push_str("bind\t");
+            manifest.push_str(guest);
+            manifest.push('\t');
+            manifest.push_str(&canonical);
+            manifest.push('\n');
+        }
+    }
+
+    let manifest_path = config.state_root.join("host-shares");
+    if manifest.is_empty() {
+        match std::fs::remove_file(&manifest_path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(io_err(error)),
+        }
+    } else {
+        let temporary = config.state_root.join("host-shares.tmp");
+        std::fs::write(&temporary, manifest).map_err(io_err)?;
+        std::fs::rename(temporary, manifest_path).map_err(io_err)?;
+    }
     Ok(exports)
 }
 
@@ -357,4 +413,61 @@ fn io_err(err: io::Error) -> Error {
 
 fn fail(code: ErrorCode, message: impl Into<String>) -> Error {
     Error::new(code, message, "")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::plan_exports;
+    use crate::config::Config;
+
+    #[test]
+    fn exports_host_share_at_original_and_canonical_paths() {
+        let root = tempfile::tempdir().unwrap();
+        let data = root.path().join("data with spaces");
+        let target = data.join("real directory");
+        let alias = data.join("share alias");
+        let state = data.join("oci-cri/state");
+        std::fs::create_dir_all(&target).unwrap();
+        std::fs::create_dir_all(&state).unwrap();
+        std::os::unix::fs::symlink(&target, &alias).unwrap();
+
+        let config = Config {
+            root: data.join("oci-cri/root"),
+            state_root: state.clone(),
+            host_shares: vec![alias.clone()],
+            ..Config::default()
+        };
+        std::fs::create_dir_all(&config.root).unwrap();
+        let exports = plan_exports(&config).unwrap();
+        let host_export = exports.iter().find(|export| export.tag == "host0").unwrap();
+        assert_eq!(host_export.host, target.canonicalize().unwrap());
+        assert_eq!(host_export.guest, alias.to_str().unwrap());
+        assert_eq!(
+            std::fs::read_to_string(state.join("host-shares")).unwrap(),
+            format!(
+                "virtiofs\thost0\t{}\nbind\t{}\t{}\n",
+                alias.display(),
+                alias.display(),
+                target.canonicalize().unwrap().display()
+            )
+        );
+    }
+
+    #[test]
+    fn removes_stale_host_share_manifest_when_no_shares_are_configured() {
+        let root = tempfile::tempdir().unwrap();
+        let state = root.path().join("state");
+        std::fs::create_dir_all(&state).unwrap();
+        let manifest = state.join("host-shares");
+        std::fs::write(&manifest, "stale\n").unwrap();
+        let config = Config {
+            root: root.path().join("root"),
+            state_root: state,
+            ..Config::default()
+        };
+        std::fs::create_dir_all(&config.root).unwrap();
+
+        plan_exports(&config).unwrap();
+        assert!(!manifest.exists());
+    }
 }

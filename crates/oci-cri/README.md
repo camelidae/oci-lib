@@ -139,9 +139,30 @@ the guest. Build the guest on Linux with `cargo xtask guest oci-cri` (or let
 the release download cache supply images once published). Until those artifacts
 exist, keep `vm` opt-in so plain workspace builds stay green.
 
-MVP limits: CNI is disabled in the guest (sandboxes share the guest netns);
-Exec/Attach streaming URLs are not rewritten to the host, so kubelet streaming
-against a Mac-hosted socket is not supported yet.
+To feed a [diorama-vm](https://github.com/camelidae/diorama-vm) kernel and
+gVisor `runsc` into the existing embed path (no host protocol changes):
+
+```sh
+# Download Image + runsc from the latest camelidae/diorama-vm GitHub release:
+./scripts/wire-diorama-vm-guest.sh
+
+# Or pin a release / use a local checkout:
+# DIORAMA_VM_RELEASE=v0.1.0 ./scripts/wire-diorama-vm-guest.sh
+# DIORAMA_VM=/path/to/diorama-vm BUILD_AGENT=0 ./scripts/wire-diorama-vm-guest.sh
+```
+
+That script rebuilds the Linux `oci-cri` agent (unless `BUILD_AGENT=0`), embeds
+`/bin/runsc`, swaps in the diorama-vm `Image`, refreshes `attestation.json`, and
+writes `crates/oci-cri/guest/out/`. Prefer a local `DIORAMA_VM` checkout when
+present; otherwise it downloads from `camelidae/diorama-vm` releases
+(`DIORAMA_VM_RELEASE`, default `latest`). The oci-lib release workflow does the
+same via `ROK_GUEST_KERNEL_SRC` / `ROK_RUNSC` during `cargo xtask guest`.
+Guest init sets `ROK_OCI_RUNTIME=/bin/runsc` so the shim drives containers
+through runsc instead of libcontainer. Kernels without `veth` skip guest CNI
+(sandboxes share the guest netns).
+
+MVP limits: guest CNI needs a kernel with `veth`/bridge; without it sandboxes
+share the guest netns. Exec/Attach streaming URLs bind the guest NAT address.
 
 ## Container startup and DNS
 

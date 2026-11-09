@@ -22,6 +22,7 @@ fn run() -> Result<(), String> {
     println!("cargo:rerun-if-env-changed=ROK_DISABLE_OPTIONAL_LIBS");
     println!("cargo:rerun-if-env-changed=PKG_CONFIG_PATH");
     println!("cargo:rerun-if-env-changed=CC");
+    println!("cargo:rerun-if-env-changed=HOST_CC");
     println!("cargo:rerun-if-env-changed=CGO_ENABLED");
 
     let manifest = PathBuf::from(env::var("CARGO_MANIFEST_DIR").map_err(|e| e.to_string())?);
@@ -109,7 +110,17 @@ fn compile_stub() {
 }
 
 fn emit_abi(manifest: &Path, out_dir: &Path) -> Result<(), String> {
-    let compiler = env::var("CC").unwrap_or_else(|_| "cc".to_string());
+    let host = env::var("HOST").unwrap_or_default();
+    let target = env::var("TARGET").unwrap_or_default();
+    let compiler = env::var("HOST_CC")
+        .or_else(|_| {
+            if host == target {
+                env::var("CC")
+            } else {
+                Ok("cc".to_string())
+            }
+        })
+        .unwrap_or_else(|_| "cc".to_string());
     let bin = out_dir.join("abi_size");
     let output = Command::new(&compiler)
         .arg("-I")

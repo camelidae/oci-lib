@@ -185,6 +185,10 @@ printf '%s\n' 'hosts: files dns' >> /etc/nsswitch.conf
 
 mkdir -p /sys/fs/cgroup
 mount -t cgroup2 cgroup2 /sys/fs/cgroup || true
+# runsc probes cgroup controllers even with --ignore-cgroups.
+for c in pids memory cpu io cpuset; do
+    echo "+$c" > /sys/fs/cgroup/cgroup.subtree_control 2>/dev/null || true
+done
 
 # containers/storage cannot live directly on Apple virtiofs (EPERM on chown).
 # Keep the share and mount an ext image from it at /mnt/root.
@@ -198,8 +202,16 @@ if mount -t virtiofs root /mnt/.host-root 2>/dev/null; then
     else
         echo "oci-cri: existing rok-store.img left unchanged; this guest does not grow it. Recreation: shut the VM down, copy the image aside, delete rok-store.img, and let the next boot create a new sparse 8GiB image." >&2
     fi
-    if mount -t ext4 "$img" /mnt/root 2>/dev/null || mount -t ext2 "$img" /mnt/root; then
+    if mount -t ext4 "$img" /mnt/root 2>/dev/null || mount -t ext2 "$img" /mnt/root 2>/dev/null; then
         root_mounted=1
+    else
+        # Kernels without CONFIG_BLK_DEV_LOOP (for example diorama-vm's Image)
+        # cannot mount the sparse store image. Fall back to tmpfs so CRI still
+        # boots; image layers will not persist across guest restarts.
+        echo "oci-cri: could not mount rok-store.img (loop/ext missing?); using tmpfs for /mnt/root" >&2
+        if mount -t tmpfs tmpfs /mnt/root; then
+            root_mounted=1
+        fi
     fi
 elif mount -t tmpfs tmpfs /mnt/root; then
     root_mounted=1
@@ -208,7 +220,7 @@ if [ "$root_mounted" != 1 ]; then
     echo "oci-cri: failed to mount /mnt/root" >&2
     exit 1
 fi
-mkdir -p /mnt/root/tmp
+mkdir -p /mnt/root/tmp /var/run/runsc
 chmod 1777 /mnt/root/tmp
 export TMPDIR=/mnt/root/tmp
 export TMP=/mnt/root/tmp
@@ -218,6 +230,56 @@ export TEMP=/mnt/root/tmp
 if ! mount -t virtiofs runroot /mnt/runroot 2>/dev/null; then
     mount -t tmpfs tmpfs /mnt/runroot
 fi
+
+# Prefer gVisor when the guest image includes runsc (diorama-vm feed).
+if [ -x /bin/runsc ]; then
+    export ROK_OCI_RUNTIME=/bin/runsc
+    echo "oci-cri: using external OCI runtime $ROK_OCI_RUNTIME" >&2
+fi
+
+# The host can export extra writable paths (for example kubelet pod volumes)
+# at their original absolute paths. Tab-separated fields preserve spaces.
+mount_host_shares() {
+    manifest=/mnt/runroot/host-shares
+    [ -r "$manifest" ] || return 0
+    tab=$(printf '\t')
+    while IFS="$tab" read -r kind first second; do
+        case "$kind" in
+            virtiofs)
+                case "$first" in
+                    ''|*[!A-Za-z0-9_.-]*)
+                        echo "oci-cri: invalid host share tag" >&2
+                        return 1
+                        ;;
+                esac
+                case "$second" in
+                    /*) ;;
+                    *) echo "oci-cri: host share path is not absolute" >&2; return 1 ;;
+                esac
+                mkdir -p "$second" || return 1
+                if ! mount -t virtiofs "$first" "$second"; then
+                    echo "oci-cri: failed to mount host share at $second" >&2
+                    return 1
+                fi
+                ;;
+            bind)
+                case "$first:$second" in
+                    /*:/*) ;;
+                    *) echo "oci-cri: invalid host share alias" >&2; return 1 ;;
+                esac
+                mkdir -p "$second" || return 1
+                if ! mount -o bind "$first" "$second"; then
+                    echo "oci-cri: failed to bind host share alias $first to $second" >&2
+                    return 1
+                fi
+                ;;
+            '') ;;
+            *) echo "oci-cri: invalid host share manifest entry" >&2; return 1 ;;
+        esac
+    done < "$manifest"
+}
+mount_host_shares || exit 1
+
 mkdir -p /run/oci-cri
 
 ip link set lo up 2>/dev/null || true

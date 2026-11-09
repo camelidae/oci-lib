@@ -131,6 +131,7 @@ impl RuntimeArgs {
             socket: self.socket,
             root: self.root,
             state_root: self.state_root,
+            host_shares: Vec::new(),
             sandbox_image: self.sandbox_image,
             cni_bin_dir: self.cni_bin_dir,
             cni_conf_dir: self.cni_conf_dir,

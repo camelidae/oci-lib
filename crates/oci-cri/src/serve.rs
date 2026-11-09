@@ -5,8 +5,10 @@
 //! Listens on [`crate::proto::VSOCK_PORT`], writes [`GUEST_BANNER`] on each
 //! accept, then proxies bytes to the in-guest CRI unix socket.
 
+use std::ffi::CStr;
 use std::fs::File;
 use std::io::{self, Write};
+use std::net::Ipv4Addr;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -30,16 +32,15 @@ pub fn engine_serve() -> Result<i32, Error> {
     std::fs::create_dir_all(&state_root).map_err(io_err)?;
     std::fs::create_dir_all("/run/oci-cri").map_err(io_err)?;
 
-    let config = Config {
+    let mut config = Config {
         runtime_config_dir: Some(PathBuf::from("/etc/oci-cri/config.d")),
         runtimes: Default::default(),
         runtime_name: crate::config::RUNTIME_NAME.to_string(),
         socket: socket.clone(),
         root: root.clone(),
         state_root: state_root.clone(),
+        host_shares: Vec::new(),
         sandbox_image: "registry.k8s.io/pause:3.10.1".to_string(),
-        // CNI on the macOS guest is out of scope for the MVP; sandboxes share
-        // the guest network namespace.
         cni_bin_dir: None,
         cni_conf_dir: None,
         cni_plugin_dirs: Vec::new(),
@@ -48,6 +49,7 @@ pub fn engine_serve() -> Result<i32, Error> {
         pod_cidr: String::new(),
         insecure_registries: false,
     };
+    configure_guest_network(&mut config)?;
     config.validate()?;
 
     crate::linux::open()?;
@@ -79,6 +81,111 @@ pub fn engine_serve() -> Result<i32, Error> {
     let _ = crate::linux::shutdown();
     let _ = cri.join();
     result
+}
+
+fn configure_guest_network(config: &mut Config) -> Result<(), Error> {
+    let Some((interface, address, prefix)) = guest_uplink() else {
+        eprintln!("oci-cri: no guest NAT IPv4 uplink found; CNI remains disabled");
+        return Ok(());
+    };
+    // Streaming URLs still need the NAT-facing address even when CNI is off.
+    config.streaming_address = address.to_string();
+
+    // diorama-vm kernels defer VETH/BRIDGE; without them the bridge CNI plugin
+    // hangs RunPodSandbox. Skip CNI until the guest has veth, or when asked.
+    if std::env::var_os("ROK_DISABLE_GUEST_CNI").is_some() {
+        eprintln!("oci-cri: guest CNI disabled by ROK_DISABLE_GUEST_CNI; streaming on {address}");
+        return Ok(());
+    }
+    if !Path::new("/sys/module/veth").is_dir() {
+        eprintln!(
+            "oci-cri: kernel has no veth module; CNI disabled (sandboxes share guest netns); streaming on {address}"
+        );
+        return Ok(());
+    }
+
+    let Some(pod_network) = crate::network::guest_pod_network(address, prefix) else {
+        eprintln!(
+            "oci-cri: guest NAT subnet {address}/{prefix} is too small for a pod range; CNI remains disabled"
+        );
+        return Ok(());
+    };
+
+    let config_dir = PathBuf::from("/etc/cni/net.d");
+    std::fs::create_dir_all(&config_dir).map_err(io_err)?;
+    let conflist = crate::network::guest_conflist(pod_network, 1280);
+    let mut bytes = serde_json::to_vec_pretty(&conflist)
+        .map_err(|error| Error::new(ErrorCode::Internal, error.to_string(), ""))?;
+    bytes.push(b'\n');
+    std::fs::write(config_dir.join("10-oci-cri-guest.conflist"), bytes).map_err(io_err)?;
+    std::fs::write("/proc/sys/net/ipv4/ip_forward", "1").map_err(io_err)?;
+    std::fs::write(
+        format!("/proc/sys/net/ipv4/conf/{interface}/proxy_arp"),
+        "1",
+    )
+    .map_err(io_err)?;
+
+    config.cni_bin_dir = Some(PathBuf::from("/opt/cni/bin"));
+    config.cni_conf_dir = Some(config_dir);
+    eprintln!(
+        "oci-cri: guest CNI subnet {}/{}, gateway {}; streaming on {address}",
+        pod_network.subnet, pod_network.prefix, pod_network.gateway
+    );
+    Ok(())
+}
+
+fn guest_uplink() -> Option<(String, Ipv4Addr, u8)> {
+    let mut head = std::ptr::null_mut();
+    if unsafe { libc::getifaddrs(&mut head) } != 0 {
+        return None;
+    }
+
+    let mut result = None;
+    let mut current = head;
+    while !current.is_null() {
+        let interface = unsafe { &*current };
+        if !interface.ifa_addr.is_null()
+            && !interface.ifa_netmask.is_null()
+            && unsafe { (*interface.ifa_addr).sa_family as i32 } == libc::AF_INET
+        {
+            let name = unsafe { CStr::from_ptr(interface.ifa_name) }.to_str().ok();
+            if let Some(name) = name.filter(|name| {
+                *name != "lo"
+                    && Path::new("/sys/class/net")
+                        .join(name)
+                        .join("device")
+                        .exists()
+            }) {
+                let address = unsafe { &*(interface.ifa_addr.cast::<libc::sockaddr_in>()) }
+                    .sin_addr
+                    .s_addr
+                    .to_ne_bytes();
+                let netmask = unsafe { &*(interface.ifa_netmask.cast::<libc::sockaddr_in>()) }
+                    .sin_addr
+                    .s_addr
+                    .to_ne_bytes();
+                let address = Ipv4Addr::from(address);
+                if let Some(prefix) = ipv4_prefix(Ipv4Addr::from(netmask)) {
+                    result = Some((name.to_owned(), address, prefix));
+                    break;
+                }
+            }
+        }
+        current = interface.ifa_next;
+    }
+    unsafe { libc::freeifaddrs(head) };
+    result
+}
+
+fn ipv4_prefix(netmask: Ipv4Addr) -> Option<u8> {
+    let mask = u32::from_be_bytes(netmask.octets());
+    let prefix = mask.leading_ones();
+    let expected = if prefix == 0 {
+        0
+    } else {
+        u32::MAX << (32 - prefix)
+    };
+    (mask == expected).then_some(prefix as u8)
 }
 
 fn accept_loop(listener: OwnedFd, socket: &PathBuf) -> Result<i32, Error> {

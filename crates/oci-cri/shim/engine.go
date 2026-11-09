@@ -107,36 +107,84 @@ func dispatch(req *opRequest, hooks *ioHooks) (string, error) {
 		err = opReleaseRootfs(req)
 		response = map[string]any{}
 	case "create":
-		err = opCreate(req)
+		if useExternalRuntime() {
+			err = opCreateExternal(req)
+		} else {
+			err = opCreate(req)
+		}
 		response = map[string]any{}
 	case "start":
-		err = opStart(req, hooks)
+		if useExternalRuntime() {
+			err = opStartExternal(req, hooks)
+		} else {
+			err = opStart(req, hooks)
+		}
 		response = map[string]any{}
 	case "wait":
-		response, err = opWait(req)
+		if useExternalRuntime() {
+			response, err = opWaitExternal(req)
+		} else {
+			response, err = opWait(req)
+		}
 	case "kill":
-		err = opKill(req)
+		if useExternalRuntime() {
+			err = opKillExternal(req)
+		} else {
+			err = opKill(req)
+		}
 		response = map[string]any{}
 	case "delete":
-		err = opDelete(req)
+		if useExternalRuntime() {
+			err = opDeleteExternal(req)
+		} else {
+			err = opDelete(req)
+		}
 		response = map[string]any{}
 	case "state":
-		response, err = opState(req)
+		if useExternalRuntime() {
+			response, err = opStateExternal(req)
+		} else {
+			response, err = opState(req)
+		}
 	case "stats":
-		response, err = opStats(req)
+		if useExternalRuntime() {
+			response, err = opStatsExternal(req)
+		} else {
+			response, err = opStats(req)
+		}
 	case "update":
-		err = opUpdate(req)
+		if useExternalRuntime() {
+			err = opUpdateExternal(req)
+		} else {
+			err = opUpdate(req)
+		}
 		response = map[string]any{}
 	case "exec":
-		response, err = opExec(req, hooks)
+		if useExternalRuntime() {
+			response, err = opExecExternal(req, hooks)
+		} else {
+			response, err = opExec(req, hooks)
+		}
 	case "write_stdin":
-		err = opWriteStdin(req)
+		if useExternalRuntime() {
+			err = opWriteStdinExternal(req)
+		} else {
+			err = opWriteStdin(req)
+		}
 		response = map[string]any{}
 	case "resize":
-		err = opResize(req)
+		if useExternalRuntime() {
+			err = opResizeExternal(req)
+		} else {
+			err = opResize(req)
+		}
 		response = map[string]any{}
 	case "checkpoint":
-		err = opCheckpoint(req)
+		if useExternalRuntime() {
+			err = opCheckpointExternal(req)
+		} else {
+			err = opCheckpoint(req)
+		}
 		response = map[string]any{}
 	default:
 		return "", fail(codeInvalid, "unknown op "+req.Op, "")

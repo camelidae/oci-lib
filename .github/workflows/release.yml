@@ -10,9 +10,19 @@ on:
   # Auto Tag pushes the tag with GITHUB_TOKEN, which does not fire push: tags.
   # Explicit workflow_dispatch trigger allows Auto Tag and maintainers to dispatch release workflows.
   workflow_dispatch:
+    inputs:
+      diorama_vm_release:
+        description: camelidae/diorama-vm release tag to embed (e.g. v0.1.0, or latest)
+        required: false
+        default: latest
+        type: string
 
 permissions:
   contents: read
+
+env:
+  DIORAMA_VM_REPO: camelidae/diorama-vm
+  DIORAMA_VM_RELEASE: ${{ github.event.inputs.diorama_vm_release || vars.DIORAMA_VM_RELEASE || 'latest' }}
 
 concurrency:
   group: release-${{ github.ref }}
@@ -99,10 +109,43 @@ jobs:
         with:
           name: ${{ matrix.target }}
           path: dist/
+      - name: Download diorama-vm Image and runsc
+        if: matrix.guest
+        run: |
+          set -euo pipefail
+          mkdir -p "$HOME/diorama-vm-feed"
+          tag="${DIORAMA_VM_RELEASE}"
+          if [[ -z "$tag" || "$tag" == "latest" ]]; then
+            tag="$(curl -fsSL "https://api.github.com/repos/${DIORAMA_VM_REPO}/releases/latest" \
+              | python3 -c 'import json,sys; print(json.load(sys.stdin)["tag_name"])')"
+          fi
+          base="https://github.com/${DIORAMA_VM_REPO}/releases/download/${tag}"
+          echo "embedding diorama-vm ${tag}"
+          curl -fsSL -o "$HOME/diorama-vm-feed/Image" "${base}/Image"
+          curl -fsSL -o "$HOME/diorama-vm-feed/runsc" "${base}/runsc"
+          curl -fsSL -o "$HOME/diorama-vm-feed/SHA256SUMS" "${base}/SHA256SUMS"
+          (
+            cd "$HOME/diorama-vm-feed"
+            awk '/ (Image|runsc)$/ {print}' SHA256SUMS | sha256sum -c -
+          )
+          chmod +x "$HOME/diorama-vm-feed/runsc"
+          echo "DIORAMA_VM_TAG=${tag}" >> "$GITHUB_ENV"
+          echo "ROK_GUEST_KERNEL_SRC=$HOME/diorama-vm-feed/Image" >> "$GITHUB_ENV"
+          echo "ROK_RUNSC=$HOME/diorama-vm-feed/runsc" >> "$GITHUB_ENV"
       - name: Build the Apple Silicon guests
         if: matrix.guest
         run: |
+          set -euo pipefail
           cargo xtask guest oci-builder oci-runner oci-cri
+          python3 - <<'PY'
+          import json, os, pathlib
+          root = pathlib.Path("crates/oci-cri/guest/out")
+          att = json.loads((root / "attestation.json").read_text())
+          members = {m["path"] for m in att.get("members", [])}
+          if "bin/runsc" not in members:
+              raise SystemExit("oci-cri guest attestation missing bin/runsc; check ROK_RUNSC")
+          print(f"oci-cri guest embeds runsc; diorama-vm tag={os.environ.get('DIORAMA_VM_TAG', '?')}")
+          PY
       - name: Validate guest compatibility metadata
         if: matrix.guest
         run: |
