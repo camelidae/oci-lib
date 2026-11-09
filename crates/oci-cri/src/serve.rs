@@ -78,8 +78,21 @@ pub fn engine_serve() -> Result<i32, Error> {
         streaming_address: "127.0.0.1".to_string(),
         streaming_port: 0,
         pod_cidr: String::new(),
-        insecure_registries: false,
+        // Host writes the runroot marker when Config::insecure_registries is
+        // set. Default true for this guest path: diorama's in-cluster
+        // registry speaks plain HTTP and DockerInsecureSkipTLSVerify is what
+        // unlocks the containers/image HTTPS→HTTP fallback.
+        insecure_registries: true,
     };
+    if !state_root
+        .join(crate::config::INSECURE_REGISTRIES_MARKER)
+        .is_file()
+    {
+        eprintln!(
+            "oci-cri: insecure registries enabled by guest default (no {} marker)",
+            crate::config::INSECURE_REGISTRIES_MARKER
+        );
+    }
     configure_guest_network(&mut config)?;
     config.validate()?;
 

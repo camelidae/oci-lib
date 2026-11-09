@@ -125,6 +125,8 @@ fn open(config: &Config) -> Result<(), Error> {
     }
     std::fs::create_dir_all(&config.root).map_err(io_err)?;
     std::fs::create_dir_all(&config.state_root).map_err(io_err)?;
+    crate::config::sync_insecure_registries_marker(&config.state_root, config.insecure_registries)
+        .map_err(io_err)?;
     let exports = plan_exports(config)?;
     let (kernel, initrd) = locate_artifacts()?;
     let mut slot = SESSION.lock().unwrap_or_else(|poison| poison.into_inner());
