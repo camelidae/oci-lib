@@ -167,16 +167,41 @@ pub const CRI_INIT: &str = r#"#!/bin/busybox sh
 # PID 1 for the macOS Virtualization.framework CRI guest.
 # Mounts the virtiofs tags the host exported, brings up NAT, then runs the agent.
 
+# runsc pivot_root refuses the initial rootfs mount. Leave it for a tmpfs root
+# before any virtiofs or store mount, then continue this same script there.
+if [ "$1" != rooted ]; then
+    /bin/busybox --install -s /bin
+    export PATH=/bin:/sbin:/usr/bin:/usr/sbin
+    mkdir -p /proc /sys /dev /newroot
+    mount -t proc proc /proc
+    mount -t sysfs sysfs /sys
+    mount -t devtmpfs devtmpfs /dev
+    mount -t tmpfs -o mode=755 tmpfs /newroot
+    cp -a /bin /newroot/
+    [ -d /lib ] && cp -a /lib /newroot/
+    [ -d /usr ] && cp -a /usr /newroot/
+    [ -d /etc ] && cp -a /etc /newroot/
+    [ -d /opt ] && cp -a /opt /newroot/
+    [ -d /var ] && cp -a /var /newroot/
+    [ -e /oci-cri ] && cp -a /oci-cri /newroot/
+    [ -e /udhcpc.script ] && cp -a /udhcpc.script /newroot/
+    cp -a /init /newroot/init
+    mkdir -p /newroot/proc /newroot/sys /newroot/dev /newroot/tmp \
+        /newroot/mnt /newroot/root /newroot/run /newroot/var/tmp /newroot/var/run
+    echo "oci-cri: switching root to tmpfs for runsc pivot_root" >&2
+    exec switch_root /newroot /bin/busybox sh /init rooted
+fi
+
 /bin/busybox --install -s /bin
 
 export PATH=/bin:/sbin:/usr/bin:/usr/sbin
 mkdir -p /proc /sys /dev /etc /root /mnt /tmp /var/tmp /var/run /run
-mount -t proc proc /proc
-mount -t sysfs sysfs /sys
-mount -t devtmpfs devtmpfs /dev
+mount -t proc proc /proc 2>/dev/null || true
+mount -t sysfs sysfs /sys 2>/dev/null || true
+mount -t devtmpfs devtmpfs /dev 2>/dev/null || true
 mkdir -p /dev/pts /dev/shm
-mount -t devpts devpts /dev/pts
-mount -t tmpfs tmpfs /dev/shm
+mount -t devpts devpts /dev/pts 2>/dev/null || true
+mount -t tmpfs tmpfs /dev/shm 2>/dev/null || true
 
 printf '%s\n' 'root:x:0:0:root:/root:/bin/sh' > /etc/passwd
 printf '%s\n' 'root:x:0:' > /etc/group
