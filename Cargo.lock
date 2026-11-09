@@ -1738,7 +1738,7 @@ dependencies = [
 
 [[package]]
 name = "oci-builder"
-version = "0.1.15"
+version = "0.1.16"
 dependencies = [
  "base64 0.23.1",
  "cc",
@@ -1755,7 +1755,7 @@ dependencies = [
 
 [[package]]
 name = "oci-cri"
-version = "0.1.15"
+version = "0.1.16"
 dependencies = [
  "base64 0.23.1",
  "cc",
@@ -1788,7 +1788,7 @@ dependencies = [
 
 [[package]]
 name = "oci-runner"
-version = "0.1.15"
+version = "0.1.16"
 dependencies = [
  "cc",
  "clap",
@@ -1818,7 +1818,7 @@ dependencies = [
 
 [[package]]
 name = "oci-util"
-version = "0.1.15"
+version = "0.1.16"
 dependencies = [
  "base64 0.23.1",
  "block2",
