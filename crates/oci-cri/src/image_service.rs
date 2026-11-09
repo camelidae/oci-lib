@@ -144,6 +144,7 @@ impl ImageService for CriService {
                 identity_token: a.identity_token,
             });
             let image = crate::image_reference::normalize(&spec.image)?;
+            crate::registry_hosts::map_pull_host(&inner.store.sandboxes(), &image)?;
             let plugin = crate::runtime_plugin::resolve(&inner.config, &spec.runtime_handler)?;
             let id = inner.engine.pull_image_for_platform(
                 &image,
