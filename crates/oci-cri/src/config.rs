@@ -3,7 +3,7 @@
 //! Runtime configuration for the CRI daemon.
 
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// Neutral default name kubelet sees when no product branding is applied.
 pub const RUNTIME_NAME: &str = "oci-cri";
@@ -47,6 +47,32 @@ pub struct Config {
     pub pod_cidr: String,
     /// Allow HTTP registries / skipped TLS verification when pulling.
     pub insecure_registries: bool,
+}
+
+/// Marker file under `Config::state_root` (guest `/mnt/runroot`) that enables
+/// HTTP / skip-TLS image pulls. The macOS host writes this from
+/// `Config::insecure_registries` before booting the guest.
+pub const INSECURE_REGISTRIES_MARKER: &str = "insecure-registries";
+
+/// Write or remove [`INSECURE_REGISTRIES_MARKER`] under `state_root`.
+///
+/// The macOS host calls this before booting the guest. The guest image pull
+/// path still defaults insecure pulls on, because the in-cluster registry is
+/// plain HTTP; the marker records the host's choice for that boot.
+pub fn sync_insecure_registries_marker(state_root: &Path, enabled: bool) -> std::io::Result<()> {
+    let path = state_root.join(INSECURE_REGISTRIES_MARKER);
+    if enabled {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(path, b"1\n")
+    } else {
+        match std::fs::remove_file(path) {
+            Ok(()) => Ok(()),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(err) => Err(err),
+        }
+    }
 }
 
 impl Default for Config {
@@ -232,6 +258,19 @@ mod tests {
             ..Config::default()
         };
         config.validate().unwrap();
+    }
+
+    #[test]
+    fn insecure_registries_marker_tracks_the_host_flag() {
+        let dir = std::env::temp_dir().join(format!("oci-cri-marker-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        sync_insecure_registries_marker(&dir, true).unwrap();
+        let path = dir.join(INSECURE_REGISTRIES_MARKER);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "1\n");
+        sync_insecure_registries_marker(&dir, false).unwrap();
+        assert!(!path.exists());
+        sync_insecure_registries_marker(&dir, false).unwrap();
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

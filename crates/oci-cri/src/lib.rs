@@ -31,6 +31,7 @@ mod image_service;
 pub mod logs;
 pub mod network;
 pub mod proto;
+mod registry_hosts;
 pub mod server;
 pub mod service;
 pub mod store;

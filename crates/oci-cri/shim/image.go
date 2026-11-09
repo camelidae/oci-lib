@@ -29,11 +29,19 @@ var (
 	storeByRoot   = map[string]storage.Store{}
 )
 
+func imageRuntimeKey(root string, insecure bool) string {
+	if insecure {
+		return root + "\x00insecure"
+	}
+	return root
+}
+
 func imageRuntime(root string, insecure bool, auth *authConfig) (*libimage.Runtime, storage.Store, error) {
 	runtimeMu.Lock()
 	defer runtimeMu.Unlock()
-	if rt, ok := runtimeByRoot[root]; ok {
-		return rt, storeByRoot[root], nil
+	key := imageRuntimeKey(root, insecure)
+	if rt, ok := runtimeByRoot[key]; ok {
+		return rt, storeByRoot[key], nil
 	}
 	if root == "" {
 		root = "/var/lib/oci-cri"
@@ -67,6 +75,15 @@ func imageRuntime(root string, insecure bool, auth *authConfig) (*libimage.Runti
 	}
 	if insecure {
 		sys.DockerInsecureSkipTLSVerify = types.OptionalBoolTrue
+		// containers/image only falls back HTTPS→HTTP when
+		// tls.Config.InsecureSkipVerify is set. Registries.conf `insecure`
+		// sets that at client construction (prefix match); also keep
+		// DockerInsecureSkipTLSVerify for hosts that don't match below.
+		registriesPath := filepath.Join(root, "registries.conf")
+		if err := os.WriteFile(registriesPath, insecureRegistriesConf(), 0o644); err != nil {
+			return nil, nil, fail(codeInternal, "registries.conf", err.Error())
+		}
+		sys.SystemRegistriesConfPath = registriesPath
 	}
 	if auth != nil && (auth.Username != "" || auth.Password != "" || auth.Auth != "") {
 		sys.DockerAuthConfig = &types.DockerAuthConfig{
@@ -99,8 +116,8 @@ func imageRuntime(root string, insecure bool, auth *authConfig) (*libimage.Runti
 	if err != nil {
 		return nil, nil, fail(codeInternal, "image runtime", err.Error())
 	}
-	runtimeByRoot[root] = rt
-	storeByRoot[root] = store
+	runtimeByRoot[key] = rt
+	storeByRoot[key] = store
 	return rt, store, nil
 }
 

@@ -393,6 +393,15 @@ fn select_vm_cpu_count(host_count: Option<usize>, min: usize, max: usize) -> usi
     host_count.unwrap_or(2).clamp(min, max)
 }
 
+/// One gibibyte is the framework floor and is not enough for the node workloads
+/// plus the in-cluster registry. Four gibibytes keeps that guest from failing
+/// atomic page allocation while the registry is running.
+const VM_MEMORY_SIZE: u64 = 4 * 1024 * 1024 * 1024;
+
+fn select_vm_memory_size(preferred: u64, min: u64, max: u64) -> u64 {
+    preferred.clamp(min, max)
+}
+
 fn vm_config(
     guest: &GuestConfig,
     kernel: &Path,
@@ -424,7 +433,7 @@ fn vm_config(
     let memory = {
         let min = unsafe { VZVirtualMachineConfiguration::minimumAllowedMemorySize() };
         let max = unsafe { VZVirtualMachineConfiguration::maximumAllowedMemorySize() };
-        (1024 * 1024 * 1024).clamp(min, max)
+        select_vm_memory_size(VM_MEMORY_SIZE, min, max)
     };
     unsafe {
         config.setCPUCount(cpu);
@@ -582,12 +591,24 @@ fn io_err(err: io::Error) -> VmError {
 
 #[cfg(test)]
 mod tests {
-    use super::select_vm_cpu_count;
+    use super::{VM_MEMORY_SIZE, select_vm_cpu_count, select_vm_memory_size};
 
     #[test]
     fn vm_cpu_count_tracks_host_parallelism_with_framework_bounds() {
         assert_eq!(select_vm_cpu_count(Some(16), 1, 16), 16);
         assert_eq!(select_vm_cpu_count(Some(16), 1, 8), 8);
         assert_eq!(select_vm_cpu_count(None, 1, 8), 2);
+    }
+
+    #[test]
+    fn vm_memory_size_prefers_four_gibibytes_within_framework_bounds() {
+        let gib = 1024 * 1024 * 1024;
+        assert_eq!(VM_MEMORY_SIZE, 4 * gib);
+        assert_eq!(select_vm_memory_size(VM_MEMORY_SIZE, gib, 8 * gib), 4 * gib);
+        assert_eq!(select_vm_memory_size(VM_MEMORY_SIZE, gib, 2 * gib), 2 * gib);
+        assert_eq!(
+            select_vm_memory_size(VM_MEMORY_SIZE, 8 * gib, 16 * gib),
+            8 * gib
+        );
     }
 }
