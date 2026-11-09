@@ -280,3 +280,79 @@ async fn cri_lifecycle_end_to_end() {
 
     server.abort();
 }
+
+/// Run against a live guest proxy (`oci-cri serve` built with `--features vm`):
+/// `CRI_SOCKET=/path/to/oci-cri.sock cargo test -p oci-cri --test cri_lifecycle guest_cni_assigns_pod_sandbox_ip -- --ignored --nocapture`
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires a live CRI daemon with guest CNI enabled (set CRI_SOCKET)"]
+async fn guest_cni_assigns_pod_sandbox_ip() {
+    let socket = PathBuf::from(
+        std::env::var("CRI_SOCKET").unwrap_or_else(|_| "/run/oci-cri/oci-cri.sock".to_string()),
+    );
+    wait_for_socket(&socket).await;
+    let (mut runtime, _images) = client(socket).await;
+
+    let sandbox = runtime
+        .run_pod_sandbox(RunPodSandboxRequest {
+            config: Some(PodSandboxConfig {
+                metadata: Some(PodSandboxMetadata {
+                    name: "cni-smoke".to_string(),
+                    uid: "cni-smoke-uid".to_string(),
+                    namespace: "default".to_string(),
+                    attempt: 1,
+                }),
+                hostname: "cni-smoke".to_string(),
+                linux: Some(LinuxPodSandboxConfig {
+                    security_context: Some(LinuxSandboxSecurityContext {
+                        namespace_options: Some(NamespaceOption {
+                            network: NamespaceMode::Pod as i32,
+                            ..NamespaceOption::default()
+                        }),
+                        ..LinuxSandboxSecurityContext::default()
+                    }),
+                    ..LinuxPodSandboxConfig::default()
+                }),
+                ..PodSandboxConfig::default()
+            }),
+            runtime_handler: String::new(),
+        })
+        .await
+        .expect("run non-host-network pod sandbox")
+        .into_inner();
+    let sandbox_id = sandbox.pod_sandbox_id;
+
+    let status = runtime
+        .pod_sandbox_status(PodSandboxStatusRequest {
+            pod_sandbox_id: sandbox_id.clone(),
+            verbose: false,
+        })
+        .await
+        .expect("pod sandbox status")
+        .into_inner();
+    let ip: std::net::Ipv4Addr = status
+        .status
+        .as_ref()
+        .and_then(|s| s.network.as_ref())
+        .map(|n| n.ip.as_str())
+        .unwrap_or_default()
+        .parse()
+        .expect("sandbox should receive an IPv4 address from guest CNI");
+    println!("sandbox {sandbox_id} assigned CNI IP: {ip}");
+    assert!(
+        !ip.is_unspecified() && !ip.is_loopback(),
+        "unexpected sandbox IP {ip}"
+    );
+
+    runtime
+        .stop_pod_sandbox(StopPodSandboxRequest {
+            pod_sandbox_id: sandbox_id.clone(),
+        })
+        .await
+        .expect("stop sandbox");
+    runtime
+        .remove_pod_sandbox(RemovePodSandboxRequest {
+            pod_sandbox_id: sandbox_id,
+        })
+        .await
+        .expect("remove sandbox");
+}

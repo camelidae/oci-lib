@@ -48,6 +48,8 @@ mod other;
 mod protocol_version;
 #[cfg(target_os = "linux")]
 pub mod serve;
+#[cfg(all(not(target_os = "linux"), test))]
+mod serve;
 
 #[cfg(target_os = "linux")]
 pub use linux::LinuxEngine;
