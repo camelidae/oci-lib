@@ -167,7 +167,7 @@ jobs:
         run: scripts/native-cri-conformance.sh target/debug/oci-cri "$RUNNER_TEMP/cri-native"
       - name: Preserve native regression and conformance evidence
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: cri-native-regressions
           path: |

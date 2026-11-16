@@ -105,7 +105,7 @@ jobs:
           ./dist/oci-builder --help >/dev/null
           ./dist/oci-runner --help >/dev/null
           ./dist/oci-cri --help >/dev/null
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: ${{ matrix.target }}
           path: dist/
@@ -189,17 +189,17 @@ jobs:
               if b"-----BEGIN CERTIFICATE-----" not in bundle:
                   raise SystemExit(f"{package}: CA bundle contains no PEM certificates")
           PY
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         if: matrix.guest
         with:
           name: guest-aarch64-builder
           path: crates/oci-builder/guest/out/
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         if: matrix.guest
         with:
           name: guest-aarch64-runner
           path: crates/oci-runner/guest/out/
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         if: matrix.guest
         with:
           name: guest-aarch64-cri
@@ -220,15 +220,15 @@ jobs:
           key: macos-aarch64-release-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
             macos-aarch64-release-
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: guest-aarch64-builder
           path: crates/oci-builder/guest/out
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: guest-aarch64-runner
           path: crates/oci-runner/guest/out
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: guest-aarch64-cri
           path: crates/oci-cri/guest/out
@@ -268,7 +268,7 @@ jobs:
             grep -q 'embedded guest initramfs sha256' <<<"$report"
             unset status
           done
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: aarch64-apple-darwin
           path: dist/
@@ -280,7 +280,7 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           path: artifacts
       - name: Package archives
